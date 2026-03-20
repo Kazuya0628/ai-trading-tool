@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import json
 import sys
+import time
+import traceback
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -28,6 +30,11 @@ app = Flask(__name__)
 config: TradingConfig | None = None
 broker: Any = None
 tech_analyzer: TechnicalAnalyzer | None = None
+
+# Cache to avoid hitting Twelve Data rate limits
+_cache: dict[str, Any] = {}
+_cache_time: float = 0
+_CACHE_TTL = 60  # seconds
 
 DASHBOARD_HTML = """
 <!DOCTYPE html>
@@ -197,6 +204,9 @@ DASHBOARD_HTML = """
         </div>
     </div>
 
+    <div id="loading" style="text-align:center;padding:40px;color:#888;font-size:16px;">
+        Loading chart data... (may take ~20s due to API rate limits)
+    </div>
     <div class="charts-grid" id="charts-grid"></div>
 
     <div style="padding: 12px; background: #0f0f18;">
@@ -354,13 +364,21 @@ DASHBOARD_HTML = """
                     `).join('');
                 }
 
+                document.getElementById('loading').style.display = 'none';
+
             } catch (e) {
                 console.error('Fetch error:', e);
+                document.getElementById('loading').textContent = 'Error: ' + e.message;
+                document.getElementById('loading').style.color = '#ef4444';
+                document.getElementById('update-time').textContent = 'Error';
+                document.getElementById('update-time').style.color = '#ef4444';
             }
         }
 
+        // Show loading state
+        document.getElementById('update-time').textContent = 'Loading...';
         fetchData();
-        setInterval(fetchData, 30000);
+        setInterval(fetchData, 60000);
     </script>
 </body>
 </html>
@@ -388,12 +406,20 @@ def index() -> str:
 @app.route("/api/data")
 def api_data() -> Any:
     """API endpoint returning all dashboard data."""
-    global config, broker, tech_analyzer
+    global config, broker, tech_analyzer, _cache, _cache_time
 
     if not broker or not config:
-        return jsonify({"error": "Not initialized"})
+        return jsonify({"error": "Not initialized"}), 500
+
+    # Return cached data if fresh (avoids rate limits)
+    now = time.time()
+    if _cache and (now - _cache_time) < _CACHE_TTL:
+        _cache["timestamp"] = datetime.now().strftime("%H:%M:%S")
+        _cache["cached"] = True
+        return jsonify(_cache)
 
     try:
+        logger.info("Dashboard: fetching fresh data...")
         broker.ensure_session()
         account = broker.get_account_info()
         balance = account.get("balance", 0)
@@ -401,13 +427,18 @@ def api_data() -> Any:
         # Read trade log for open positions
         positions = _get_positions()
 
-        # Build pair data with candles
+        # Build pair data with candles (with delay between requests for rate limiting)
         pairs_data = []
-        for instrument in config.active_pairs:
+        for i, instrument in enumerate(config.active_pairs):
             pair_config = config.pair_configs.get(instrument, {})
             pair_name = pair_config.get("name", instrument)
 
+            # Rate limit: wait between requests
+            if i > 0:
+                time.sleep(8)  # Twelve Data free: 8 req/min
+
             # Fetch candles
+            logger.info(f"Dashboard: fetching {instrument}...")
             df = broker.get_historical_prices(instrument, "HOUR", num_points=100)
             candles = []
             if not df.empty:
@@ -420,22 +451,19 @@ def api_data() -> Any:
                         "low": float(row["low"]),
                         "close": float(row["close"]),
                     })
+                logger.info(f"Dashboard: {instrument} -> {len(candles)} candles")
+            else:
+                logger.warning(f"Dashboard: {instrument} -> no data")
 
             # Find position for this pair
             pos_data = None
             for p in positions:
                 if p.get("instrument") == instrument:
-                    current = candles[-1]["close"] if candles else 0
-                    entry = p.get("entry", 0)
-                    direction = p.get("direction", "BUY")
-                    pnl = (current - entry) if direction == "BUY" else (entry - current)
-                    pnl_amount = pnl * p.get("size", 0) * (100 if "JPY" in instrument else 100000)
-
                     pos_data = {
-                        "entry": entry,
+                        "entry": p.get("entry", 0),
                         "sl": p.get("sl", 0),
                         "tp": p.get("tp", 0),
-                        "direction": direction,
+                        "direction": p.get("direction", "BUY"),
                     }
 
             pairs_data.append({
@@ -475,7 +503,7 @@ def api_data() -> Any:
                 "pattern": p.get("pattern", ""),
             })
 
-        return jsonify({
+        result = {
             "timestamp": datetime.now().strftime("%H:%M:%S"),
             "balance": f"¥{balance:,.0f}",
             "daily_pnl": f"¥{account.get('profit_loss', 0):+,.0f}",
@@ -486,11 +514,20 @@ def api_data() -> Any:
             "regime": "normal",
             "pairs": pairs_data,
             "positions": positions_table,
-        })
+            "cached": False,
+        }
+
+        # Cache the result
+        _cache = result
+        _cache_time = time.time()
+
+        logger.info("Dashboard: data ready")
+        return jsonify(result)
 
     except Exception as e:
         logger.error(f"Dashboard API error: {e}")
-        return jsonify({"error": str(e)})
+        logger.error(traceback.format_exc())
+        return jsonify({"error": str(e), "traceback": traceback.format_exc()}), 500
 
 
 def _get_positions() -> list[dict]:
