@@ -214,7 +214,7 @@ DASHBOARD_HTML = """
         <table class="positions-table">
             <thead>
                 <tr>
-                    <th>Pair</th><th>Direction</th><th>Entry</th>
+                    <th>Pair</th><th>Direction</th><th>Lots</th><th>Entry</th>
                     <th>Current</th><th>SL</th><th>TP</th><th>P&L</th><th>Pattern</th>
                 </tr>
             </thead>
@@ -362,12 +362,13 @@ DASHBOARD_HTML = """
                 // Update positions table
                 const tbody = document.getElementById('positions-body');
                 if (data.positions.length === 0) {
-                    tbody.innerHTML = '<tr><td colspan="8" style="text-align:center;color:#555;">No open positions</td></tr>';
+                    tbody.innerHTML = '<tr><td colspan="9" style="text-align:center;color:#555;">No open positions</td></tr>';
                 } else {
                     tbody.innerHTML = data.positions.map(p => `
                         <tr>
                             <td>${p.pair}</td>
                             <td><span class="${p.direction === 'BUY' ? 'buy-badge' : 'sell-badge'}">${p.direction}</span></td>
+                            <td>${p.lots}</td>
                             <td>${p.entry}</td>
                             <td>${p.current}</td>
                             <td style="color:#ef4444">${p.sl}</td>
@@ -518,6 +519,7 @@ def api_data() -> Any:
             positions_table.append({
                 "pair": pair_config.get("name", instrument),
                 "direction": direction,
+                "lots": f"{size:.2f}",
                 "entry": f"{entry:.{decimals}f}",
                 "current": f"{current_price:.{decimals}f}",
                 "sl": f"{p.get('sl', 0):.{decimals}f}",
