@@ -5,6 +5,7 @@ AI Sennin's approach:
 - Minimum 3 years of historical data
 - Focus on Profit Factor >= 1.2 and consistent performance
 - Walk-forward validation
+- Adaptive risk control simulation
 """
 
 from __future__ import annotations
@@ -15,6 +16,8 @@ from typing import Any
 import numpy as np
 import pandas as pd
 from loguru import logger
+
+from src.models.risk_manager import AdaptiveRiskController, MarketRegime
 
 
 @dataclass
@@ -87,12 +90,14 @@ class BacktestEngine:
         self.initial_capital = self.config.get("initial_capital", 1_000_000)
         self.commission = self.config.get("commission_per_trade", 0)
         self.slippage_pips = self.config.get("slippage_pips", 0.5)
+        self.adaptive_config = self.config.get("adaptive", {})
 
     def run(
         self,
         df: pd.DataFrame,
         signals: list[dict[str, Any]],
         pip_value: float = 0.01,
+        adaptive: bool = False,
     ) -> BacktestResult:
         """Run backtest on historical data with pre-computed signals.
 
@@ -101,6 +106,7 @@ class BacktestEngine:
             signals: List of signal dicts with keys:
                 bar_index, direction, entry_price, stop_loss, take_profit, pattern
             pip_value: Pip value for the currency pair.
+            adaptive: If True, use adaptive risk control for position sizing.
 
         Returns:
             BacktestResult with performance metrics.
@@ -113,6 +119,11 @@ class BacktestEngine:
         close = df["close"].values
         high = df["high"].values
         low = df["low"].values
+
+        # Initialize adaptive controller if requested
+        adaptive_ctrl = None
+        if adaptive:
+            adaptive_ctrl = AdaptiveRiskController(self.adaptive_config)
 
         position = None  # Active position
 
@@ -132,6 +143,18 @@ class BacktestEngine:
             tp = signal["take_profit"]
             pattern = signal.get("pattern", "")
 
+            # Adaptive: check cooldown and pattern filtering
+            if adaptive_ctrl:
+                cooldown, _ = adaptive_ctrl.should_cooldown()
+                if cooldown:
+                    # Skip this signal but count it as a cooldown period
+                    # Reset consecutive losses after skipping (simulates time passing)
+                    adaptive_ctrl.tracker.consecutive_losses = 0
+                    continue
+                skip, _ = adaptive_ctrl.should_skip_pattern(pattern)
+                if skip:
+                    continue
+
             # Apply slippage
             slippage = self.slippage_pips * pip_value
             if direction == "BUY":
@@ -139,8 +162,16 @@ class BacktestEngine:
             else:
                 entry_price -= slippage
 
-            # Position sizing (1% risk)
-            risk_per_trade = equity * 0.01
+            # Position sizing
+            base_risk_pct = 0.01  # 1%
+            if adaptive_ctrl:
+                dd_pct = (peak_equity - equity) / peak_equity * 100 if peak_equity > 0 else 0
+                risk_mult = adaptive_ctrl.calculate_risk_multiplier(dd_pct)
+                risk_pct = base_risk_pct * risk_mult
+            else:
+                risk_pct = base_risk_pct
+
+            risk_per_trade = equity * risk_pct
             stop_distance = abs(entry_price - sl)
             if stop_distance == 0:
                 continue
@@ -208,6 +239,10 @@ class BacktestEngine:
                     equity_curve.append(equity)
                     peak_equity = max(peak_equity, equity)
 
+                    # Feed result into adaptive controller
+                    if adaptive_ctrl:
+                        adaptive_ctrl.tracker.record(pnl, pattern)
+
                     position = None
                     break
 
@@ -235,6 +270,10 @@ class BacktestEngine:
                 trades.append(trade)
                 equity += pnl
                 equity_curve.append(equity)
+
+                if adaptive_ctrl:
+                    adaptive_ctrl.tracker.record(pnl, pattern)
+
                 position = None
 
         return self._calculate_metrics(trades, equity_curve)

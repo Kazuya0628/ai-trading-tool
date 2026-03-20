@@ -1,12 +1,12 @@
 """Automated Trading Bot - Main execution engine.
 
 Combines all modules into a fully automated trading system:
-1. Connect to IG Securities
+1. Connect to data source (Twelve Data or OANDA)
 2. Fetch multi-timeframe data
 3. Calculate indicators
 4. Detect patterns & AI analysis
 5. Risk validation
-6. Execute trades
+6. Execute paper trades
 7. Monitor positions
 8. Loop
 
@@ -23,23 +23,24 @@ from typing import Any
 import pandas as pd
 from loguru import logger
 
-from src.brokers.ig_client import IGClient
 from src.data.indicators import TechnicalAnalyzer
 from src.data.market_data import MarketDataManager
 from src.models.risk_manager import RiskManager
 from src.strategies.ai_analyzer import AIChartAnalyzer
 from src.strategies.pattern_detector import PatternDetector, SignalDirection
 from src.strategies.strategy_engine import StrategyEngine, TradeSignal
-from src.utils.config_loader import TradingConfig
+from src.utils.config_loader import TradingConfig, create_broker
 from src.utils.logger import log_trade, setup_logging
 from src.utils.notifier import Notifier
 
 
 class TradingBot:
-    """Fully automated FX trading bot for IG Securities.
+    """Fully automated FX trading bot.
 
-    Implements the complete trading loop with risk management,
-    pattern detection, AI analysis, and automated execution.
+    Supports multiple data sources (Twelve Data, OANDA) via
+    DATA_SOURCE environment variable. Implements the complete
+    trading loop with risk management, pattern detection,
+    AI analysis, and paper trade execution.
     """
 
     def __init__(self, config_path: str | None = None) -> None:
@@ -62,20 +63,14 @@ class TradingBot:
         logger.info("=" * 60)
         logger.info("AI FX Trading Bot - Initializing")
         logger.info(f"Mode: {'LIVE' if self.config.is_live else 'PAPER'}")
-        logger.info(f"Account: {'DEMO' if self.config.is_demo else 'LIVE'}")
+        logger.info(f"Data Source: {self.config.data_source}")
         logger.info("=" * 60)
 
-        # Initialize IG Securities client
-        self.ig_client = IGClient(
-            api_key=self.config.env["IG_API_KEY"],
-            username=self.config.env["IG_USERNAME"],
-            password=self.config.env["IG_PASSWORD"],
-            acc_type=self.config.env["IG_ACC_TYPE"],
-            acc_number=self.config.env["IG_ACC_NUMBER"],
-        )
+        # Initialize broker client (Twelve Data or OANDA)
+        self.broker = create_broker(self.config.env)
 
         # Initialize data manager
-        self.data_manager = MarketDataManager(self.ig_client)
+        self.data_manager = MarketDataManager(self.broker)
 
         # Initialize technical analyzer
         self.tech_analyzer = TechnicalAnalyzer(self.config.indicators)
@@ -103,10 +98,18 @@ class TradingBot:
         # Initialize risk manager
         self.risk_manager = RiskManager(self.config.risk_management)
 
-        # Initialize notifier
+        # Initialize notifier (Email / Discord / LINE)
         self.notifier = Notifier(
             discord_webhook=self.config.env.get("DISCORD_WEBHOOK_URL", ""),
             line_token=self.config.env.get("LINE_NOTIFY_TOKEN", ""),
+            email_config={
+                "smtp_host": self.config.env.get("SMTP_HOST", ""),
+                "smtp_port": self.config.env.get("SMTP_PORT", "587"),
+                "smtp_user": self.config.env.get("SMTP_USER", ""),
+                "smtp_password": self.config.env.get("SMTP_PASSWORD", ""),
+                "from": self.config.env.get("EMAIL_FROM", ""),
+                "to": self.config.env.get("EMAIL_TO", ""),
+            },
         )
 
         # State tracking
@@ -121,16 +124,16 @@ class TradingBot:
         """Start the automated trading loop."""
         logger.info("Starting trading bot...")
 
-        # Connect to IG Securities
-        if not self.ig_client.connect():
-            logger.error("Failed to connect to IG Securities. Aborting.")
+        # Connect to OANDA
+        if not self.broker.connect():
+            logger.error("Failed to connect to OANDA. Aborting.")
             return
 
         self._running = True
         interval = self.config.execution.get("check_interval_seconds", 300)
 
         # Initial account info
-        account = self.ig_client.get_account_info()
+        account = self.broker.get_account_info()
         if account:
             logger.info(
                 f"Account: {account.get('account_name', 'N/A')} | "
@@ -162,7 +165,7 @@ class TradingBot:
     def stop(self) -> None:
         """Stop the trading bot and disconnect."""
         self._running = False
-        self.ig_client.disconnect()
+        self.broker.disconnect()
         logger.info("Trading bot stopped")
 
     def _trading_cycle(self) -> None:
@@ -180,10 +183,10 @@ class TradingBot:
         logger.info(f"Trading cycle: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
         # Ensure session is alive
-        self.ig_client.ensure_session()
+        self.broker.ensure_session()
 
         # Get account state
-        account = self.ig_client.get_account_info()
+        account = self.broker.get_account_info()
         balance = account.get("balance", 0)
 
         # Check if trading is allowed
@@ -192,8 +195,14 @@ class TradingBot:
             logger.warning(f"Trading paused: {reason}")
             return
 
+        # Adaptive: check for forced cooldown after consecutive losses
+        cooldown, cooldown_reason = self.risk_manager.adaptive.should_cooldown()
+        if cooldown:
+            logger.warning(f"Adaptive cooldown: {cooldown_reason}")
+            return
+
         # Update open position count
-        open_positions = self.ig_client.get_open_positions()
+        open_positions = self.broker.get_open_positions()
         if not open_positions.empty:
             self.risk_manager.update_open_positions(len(open_positions))
         else:
@@ -202,38 +211,75 @@ class TradingBot:
         # Monitor existing positions (trailing stop, etc.)
         self._monitor_positions(open_positions)
 
+        # AI Market Regime Analysis (once per cycle, using first active pair)
+        self._update_market_regime()
+
         # Analyze each active pair
-        for epic in self.config.active_pairs:
+        for instrument in self.config.active_pairs:
             try:
-                self._analyze_and_trade(epic, balance)
+                self._analyze_and_trade(instrument, balance)
             except Exception as e:
-                logger.error(f"Error analyzing {epic}: {e}")
+                logger.error(f"Error analyzing {instrument}: {e}")
                 logger.debug(traceback.format_exc())
 
-        # Log risk summary
+        # Log risk summary with adaptive info
         risk_summary = self.risk_manager.get_risk_summary()
+        adaptive = risk_summary.get("adaptive", {})
         logger.info(
             f"Risk: daily_pnl=¥{risk_summary['daily_pnl']:+,.0f} | "
             f"drawdown={risk_summary['drawdown_pct']:.1f}% | "
             f"trades={risk_summary['daily_trades']} | "
-            f"positions={risk_summary['open_positions']}"
+            f"positions={risk_summary['open_positions']} | "
+            f"regime={adaptive.get('market_regime', 'N/A')} | "
+            f"win_rate={adaptive.get('recent_win_rate', 'N/A')}"
         )
 
-    def _analyze_and_trade(self, epic: str, balance: float) -> None:
+    def _update_market_regime(self) -> None:
+        """Run AI market regime analysis to update adaptive risk parameters."""
+        if not self.ai_analyzer:
+            return
+
+        try:
+            # Use first active pair's primary data for regime analysis
+            instrument = self.config.active_pairs[0]
+            resolution = self.config.timeframes.get("primary", "HOUR_4")
+            df = self.data_manager.fetch_prices(instrument, resolution, num_points=200)
+
+            if df.empty:
+                return
+
+            df = self.tech_analyzer.add_all_indicators(df)
+            regime_data = self.ai_analyzer.analyze_market_regime(df, instrument)
+
+            # Update the adaptive controller's market regime
+            from src.models.risk_manager import MarketRegime
+            self.risk_manager.adaptive.market_regime = MarketRegime(
+                regime=regime_data.get("regime", "normal"),
+                volatility_level=regime_data.get("volatility_level", "medium"),
+                trend_strength=regime_data.get("trend_strength", "moderate"),
+                risk_multiplier=regime_data.get("risk_multiplier", 0.8),
+                confidence=regime_data.get("confidence", 50),
+                reasoning=regime_data.get("reasoning", ""),
+            )
+
+        except Exception as e:
+            logger.error(f"Market regime update failed: {e}")
+
+    def _analyze_and_trade(self, instrument: str, balance: float) -> None:
         """Analyze a single currency pair and execute trades if conditions met.
 
         Args:
-            epic: IG market epic identifier.
+            instrument: OANDA instrument (e.g., 'USD_JPY').
             balance: Current account balance.
         """
-        pair_config = self.config.pair_configs.get(epic, {})
-        pair_name = pair_config.get("name", epic)
+        pair_config = self.config.pair_configs.get(instrument, {})
+        pair_name = pair_config.get("name", instrument)
         pip_value = pair_config.get("pip_value", 0.01)
 
-        logger.info(f"Analyzing {pair_name} ({epic})...")
+        logger.info(f"Analyzing {pair_name} ({instrument})...")
 
         # Check if already have position in this pair
-        if epic in self._open_trades:
+        if instrument in self._open_trades:
             logger.debug(f"Already have position in {pair_name}, skipping")
             return
 
@@ -243,7 +289,7 @@ class TradingBot:
         for tf_name in ["primary", "secondary", "trend"]:
             resolution = timeframe_config.get(tf_name)
             if resolution:
-                df = self.data_manager.fetch_prices(epic, resolution, num_points=500)
+                df = self.data_manager.fetch_prices(instrument, resolution, num_points=500)
                 if not df.empty:
                     # Add indicators
                     df = self.tech_analyzer.add_all_indicators(df)
@@ -255,7 +301,7 @@ class TradingBot:
 
         # 2. Run strategy engine
         signals = self.strategy_engine.analyze(
-            epic=epic,
+            epic=instrument,
             pair_name=pair_name,
             mtf_data=mtf_data,
             timeframe_config=timeframe_config,
@@ -265,8 +311,21 @@ class TradingBot:
             logger.info(f"No signals for {pair_name}")
             return
 
-        # 3. Take the best signal
-        best_signal = signals[0]
+        # 3. Take the best signal (with adaptive pattern filtering)
+        best_signal = None
+        for sig in signals:
+            skip, skip_reason = self.risk_manager.adaptive.should_skip_pattern(
+                sig.pattern.value
+            )
+            if skip:
+                logger.info(f"Adaptive skip for {pair_name}: {skip_reason}")
+                continue
+            best_signal = sig
+            break
+
+        if best_signal is None:
+            logger.info(f"No viable signals for {pair_name} (all filtered)")
+            return
 
         # 4. Validate signal
         valid, reason = self.risk_manager.validate_signal(best_signal)
@@ -306,49 +365,41 @@ class TradingBot:
             pip_value=pip_value,
         )
 
+        adaptive_mult = self.risk_manager.adaptive.calculate_risk_multiplier(
+            self.risk_manager.state.current_drawdown_pct
+        )
         logger.info(
             f"Trade setup: {pair_name} {best_signal.direction.value} | "
             f"Entry={best_signal.entry_price:.5f} | "
             f"SL={best_signal.stop_loss:.5f} | "
             f"TP={best_signal.take_profit:.5f} | "
             f"Size={pos_size.lots:.2f} lots | "
-            f"Risk=¥{pos_size.risk_amount:,.0f} | "
+            f"Risk=¥{pos_size.risk_amount:,.0f} ({pos_size.risk_pct:.2f}%) | "
             f"R:R={best_signal.risk_reward_ratio:.1f} | "
-            f"Confidence={best_signal.confidence:.0f}%"
+            f"Adaptive×{adaptive_mult:.2f} | "
+            f"Regime={self.risk_manager.adaptive.market_regime.regime}"
         )
 
-        # 6. Execute trade
-        if self.config.is_live:
-            self._execute_trade(epic, pair_name, best_signal, pos_size)
-        else:
-            logger.info(f"[PAPER] Would execute: {best_signal.to_dict()}")
-            log_trade(
-                f"PAPER|{pair_name}|{best_signal.direction.value}|"
-                f"entry={best_signal.entry_price:.5f}|"
-                f"sl={best_signal.stop_loss:.5f}|"
-                f"tp={best_signal.take_profit:.5f}|"
-                f"size={pos_size.lots:.2f}|"
-                f"pattern={best_signal.pattern.value}|"
-                f"confidence={best_signal.confidence:.0f}"
-            )
+        # 6. Execute trade (always paper mode)
+        self._execute_trade(instrument, pair_name, best_signal, pos_size)
 
     def _execute_trade(
         self,
-        epic: str,
+        instrument: str,
         pair_name: str,
         signal: TradeSignal,
         pos_size: Any,
     ) -> None:
-        """Execute a trade via IG Securities API.
+        """Execute a paper trade.
 
         Args:
-            epic: Market epic.
+            instrument: OANDA instrument.
             pair_name: Currency pair name.
             signal: Trade signal.
             pos_size: Position size calculation.
         """
-        result = self.ig_client.open_position(
-            epic=epic,
+        result = self.broker.open_position(
+            epic=instrument,
             direction=signal.direction.value,
             size=pos_size.lots,
             order_type="MARKET",
@@ -359,8 +410,9 @@ class TradingBot:
 
         if result.get("success"):
             deal_id = result["deal_id"]
-            self._open_trades[epic] = {
+            self._open_trades[instrument] = {
                 "deal_id": deal_id,
+                "instrument": instrument,
                 "direction": signal.direction.value,
                 "entry_price": result.get("level", signal.entry_price),
                 "stop_loss": signal.stop_loss,
@@ -398,33 +450,41 @@ class TradingBot:
         """Monitor open positions for trailing stops and exits.
 
         Args:
-            positions_df: DataFrame of open positions from IG.
+            positions_df: DataFrame of open positions.
         """
         if positions_df.empty:
             # Check if we had tracked positions that are now closed
-            for epic, trade_info in list(self._open_trades.items()):
-                logger.info(
-                    f"Position closed (externally): {epic} "
-                    f"deal={trade_info.get('deal_id', 'N/A')}"
+            for instrument, trade_info in list(self._open_trades.items()):
+                # Estimate P&L from the closed position
+                pnl = self._estimate_closed_pnl(trade_info)
+                self.risk_manager.record_trade_result(
+                    pnl=pnl,
+                    pattern=trade_info.get("pattern", ""),
+                    instrument=instrument,
                 )
-                del self._open_trades[epic]
+                logger.info(
+                    f"Position closed: {instrument} "
+                    f"deal={trade_info.get('deal_id', 'N/A')} "
+                    f"PnL=¥{pnl:+,.0f}"
+                )
+                del self._open_trades[instrument]
             return
 
         # Update trailing stops for open positions
-        for epic, trade_info in self._open_trades.items():
+        for instrument, trade_info in self._open_trades.items():
             if not self.risk_manager.trailing_stop:
                 continue
 
             try:
                 # Get current price
-                price_info = self.data_manager.get_latest_price(epic)
+                price_info = self.data_manager.get_latest_price(instrument)
                 current_price = price_info.get("mid", 0)
                 if current_price == 0:
                     continue
 
                 # Get current ATR
                 df = self.data_manager.fetch_prices(
-                    epic,
+                    instrument,
                     self.config.timeframes.get("primary", "HOUR_4"),
                     num_points=20,
                 )
@@ -441,45 +501,85 @@ class TradingBot:
                     )
 
                     if new_sl != trade_info["stop_loss"]:
-                        # Update stop on IG
-                        if self.config.is_live:
-                            self.ig_client.update_position(
-                                deal_id=trade_info["deal_id"],
-                                stop_level=new_sl,
-                            )
+                        self.broker.update_position(
+                            deal_id=trade_info["deal_id"],
+                            stop_level=new_sl,
+                        )
                         trade_info["stop_loss"] = new_sl
                         logger.info(
-                            f"Trailing stop updated: {epic} "
+                            f"Trailing stop updated: {instrument} "
                             f"new SL={new_sl:.5f}"
                         )
 
             except Exception as e:
-                logger.error(f"Error monitoring {epic}: {e}")
+                logger.error(f"Error monitoring {instrument}: {e}")
+
+    def _estimate_closed_pnl(self, trade_info: dict[str, Any]) -> float:
+        """Estimate P&L for a closed position.
+
+        Checks the broker for realized P&L, or estimates from current price.
+
+        Args:
+            trade_info: Stored trade information.
+
+        Returns:
+            Estimated profit/loss in account currency.
+        """
+        try:
+            instrument = trade_info.get("instrument", "")
+            price_info = self.data_manager.get_latest_price(instrument) if instrument else {}
+            current_price = price_info.get("mid", 0)
+
+            if current_price == 0:
+                return 0.0
+
+            entry = trade_info.get("entry_price", 0)
+            size = trade_info.get("size", 0)
+            direction = trade_info.get("direction", "BUY")
+
+            if direction == "BUY":
+                pnl = (current_price - entry) * size * 10000
+            else:
+                pnl = (entry - current_price) * size * 10000
+
+            return pnl
+
+        except Exception:
+            return 0.0
 
     # --------------------------------------------------
     # Utility Methods
     # --------------------------------------------------
 
-    def run_backtest(self, epic: str, resolution: str = "HOUR_4") -> dict:
+    def run_backtest(
+        self,
+        instrument: str,
+        resolution: str = "HOUR_4",
+        external_df: pd.DataFrame | None = None,
+    ) -> dict:
         """Run a backtest for a specific pair.
 
         Args:
-            epic: Market epic.
+            instrument: OANDA instrument.
             resolution: Data resolution.
+            external_df: External OHLCV DataFrame (e.g., from CSV/yfinance).
+                         If provided, skips API data fetch.
 
         Returns:
             Backtest results dictionary.
         """
         from src.models.backtest_engine import BacktestEngine
 
-        logger.info(f"Running backtest for {epic}...")
+        # Use external data or fetch from API
+        if external_df is not None and not external_df.empty:
+            df = external_df.copy()
+            logger.info(f"Running backtest for {instrument} with external data ({len(df)} candles)...")
+        else:
+            logger.info(f"Running backtest for {instrument} from API...")
+            if not self.broker._connected:
+                self.broker.connect()
+            df = self.data_manager.fetch_prices(instrument, resolution, num_points=500)
 
-        # Connect if needed
-        if not self.ig_client._service:
-            self.ig_client.connect()
-
-        # Fetch historical data
-        df = self.data_manager.fetch_prices(epic, resolution, num_points=500)
         if df.empty:
             logger.error("No data for backtest")
             return {}
@@ -507,22 +607,52 @@ class TradingBot:
         logger.info(f"Generated {len(signals)} signals for backtest")
 
         # Run backtest
-        pair_config = self.config.pair_configs.get(epic, {})
+        pair_config = self.config.pair_configs.get(instrument, {})
         pip_value = pair_config.get("pip_value", 0.01)
 
-        engine = BacktestEngine(self.config.backtesting)
-        result = engine.run(df, signals, pip_value)
+        bt_config = dict(self.config.backtesting)
+        bt_config["adaptive"] = self.config.risk_management.get("adaptive", {})
+        engine = BacktestEngine(bt_config)
 
-        logger.info("=" * 40)
-        logger.info("BACKTEST RESULTS")
-        for k, v in result.summary().items():
-            logger.info(f"  {k}: {v}")
+        # Run FIXED risk backtest
+        result_fixed = engine.run(df, signals, pip_value, adaptive=False)
+
+        # Run ADAPTIVE risk backtest
+        result_adaptive = engine.run(df, signals, pip_value, adaptive=True)
+
+        logger.info("=" * 60)
+        logger.info("BACKTEST COMPARISON: Fixed vs Adaptive Risk")
+        logger.info("-" * 60)
+
+        fixed_s = result_fixed.summary()
+        adaptive_s = result_adaptive.summary()
+
+        logger.info(f"  {'Metric':<25} {'Fixed':>12} {'Adaptive':>12}")
+        logger.info(f"  {'-'*25} {'-'*12} {'-'*12}")
+        for key in fixed_s:
+            logger.info(f"  {key:<25} {str(fixed_s[key]):>12} {str(adaptive_s[key]):>12}")
+
+        logger.info("-" * 60)
         logger.info(
-            f"  Meets criteria: {'YES ✓' if result.meets_criteria() else 'NO ✗'}"
+            f"  Fixed meets criteria:    {'YES' if result_fixed.meets_criteria() else 'NO'}"
         )
-        logger.info("=" * 40)
+        logger.info(
+            f"  Adaptive meets criteria: {'YES' if result_adaptive.meets_criteria() else 'NO'}"
+        )
 
-        return result.summary()
+        # Calculate drawdown improvement
+        fixed_dd = result_fixed.max_drawdown_pct
+        adaptive_dd = result_adaptive.max_drawdown_pct
+        if fixed_dd > 0:
+            dd_improvement = (1 - adaptive_dd / fixed_dd) * 100
+            logger.info(f"  Drawdown improvement:    {dd_improvement:+.1f}%")
+
+        logger.info("=" * 60)
+
+        # Return adaptive result as primary (with fixed for reference)
+        combined = adaptive_s.copy()
+        combined["fixed_comparison"] = fixed_s
+        return combined
 
     def get_status(self) -> dict[str, Any]:
         """Get current bot status.
@@ -530,11 +660,11 @@ class TradingBot:
         Returns:
             Status dictionary.
         """
-        account = self.ig_client.get_account_info()
+        account = self.broker.get_account_info()
         return {
             "running": self._running,
             "mode": "LIVE" if self.config.is_live else "PAPER",
-            "account_type": self.config.env.get("IG_ACC_TYPE", "DEMO"),
+            "data_source": self.config.data_source,
             "account": account,
             "risk": self.risk_manager.get_risk_summary(),
             "open_trades": self._open_trades,

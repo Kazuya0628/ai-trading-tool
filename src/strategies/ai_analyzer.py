@@ -138,7 +138,7 @@ class AIChartAnalyzer:
                 "style": style,
                 "title": f"{pair_name} {timeframe}" if pair_name else "",
                 "figsize": (width / 100, height / 100),
-                "volume": "Volume" in chart_df.columns and chart_df["Volume"].sum() > 0,
+                "volume": bool("Volume" in chart_df.columns and chart_df["Volume"].sum() > 0),
                 "returnfig": True,
             }
 
@@ -255,20 +255,36 @@ class AIChartAnalyzer:
             }
             pattern = pattern_map.get(pattern_name, PatternType.NO_SIGNAL)
 
-            key_levels = data.get("key_levels", {})
+            key_levels = data.get("key_levels", {}) or {}
             current_price = float(df["close"].iloc[-1]) if df is not None and not df.empty else 0
+
+            support = float(key_levels.get("support") or 0)
+            resistance = float(key_levels.get("resistance") or 0)
+            neckline = float(key_levels.get("neckline") or 0)
+
+            # Use neckline as fallback if support/resistance missing
+            if support == 0 and neckline > 0:
+                support = neckline
+            if resistance == 0 and neckline > 0:
+                resistance = neckline
+
+            if direction == SignalDirection.BUY:
+                stop_loss = support if support > 0 else current_price * 0.99
+                take_profit = resistance if resistance > 0 else current_price * 1.02
+            else:
+                stop_loss = resistance if resistance > 0 else current_price * 1.01
+                take_profit = support if support > 0 else current_price * 0.98
 
             return PatternSignal(
                 pattern=pattern,
                 direction=direction,
                 confidence=float(data.get("confidence", 50)),
                 entry_price=current_price,
-                stop_loss=float(key_levels.get("support", 0)),
-                take_profit=float(key_levels.get("resistance", 0)) if direction == SignalDirection.BUY
-                           else float(key_levels.get("support", 0)),
-                neckline=float(key_levels.get("neckline", 0)),
-                support=float(key_levels.get("support", 0)),
-                resistance=float(key_levels.get("resistance", 0)),
+                stop_loss=stop_loss,
+                take_profit=take_profit,
+                neckline=neckline,
+                support=support,
+                resistance=resistance,
                 reasoning=data.get("reasoning", "AI visual analysis"),
                 extra={"ai_source": "gemini", "raw_response": data},
             )
@@ -298,6 +314,197 @@ Return ONLY a JSON object:
   "key_levels": {"support": price, "resistance": price, "neckline": price},
   "reasoning": "brief explanation"
 }"""
+
+    def analyze_market_regime(
+        self,
+        df: pd.DataFrame,
+        pair_name: str = "",
+    ) -> dict[str, Any]:
+        """Analyze market regime using Gemini AI for adaptive risk.
+
+        Determines current market conditions (trending, ranging, volatile)
+        and returns risk adjustment recommendations.
+
+        Args:
+            df: OHLCV DataFrame with indicators.
+            pair_name: Currency pair name.
+
+        Returns:
+            Dict with regime, volatility_level, trend_strength, risk_multiplier.
+        """
+        if not self._model:
+            return self._fallback_regime_analysis(df)
+
+        try:
+            # Generate chart image for regime analysis
+            image_bytes = self.generate_chart_image(df, pair_name, "Regime Analysis")
+            if image_bytes is None:
+                return self._fallback_regime_analysis(df)
+
+            image = Image.open(io.BytesIO(image_bytes))
+
+            prompt = """Analyze this FX chart to determine the current MARKET REGIME.
+Focus on:
+1. Is the market TRENDING (clear direction) or RANGING (sideways)?
+2. What is the VOLATILITY level? (candle sizes, Bollinger Band width)
+3. How STRONG is the current trend? (moving average alignment)
+
+Return ONLY a JSON object:
+{
+  "regime": "trending" or "ranging" or "volatile" or "uncertain",
+  "volatility_level": "low" or "medium" or "high" or "extreme",
+  "trend_strength": "weak" or "moderate" or "strong",
+  "risk_multiplier": 0.0 to 1.0,
+  "reasoning": "brief explanation"
+}
+
+Risk multiplier guidelines:
+- Strong trend + low/medium volatility = 1.0 (full risk)
+- Moderate trend = 0.8
+- Ranging market = 0.6 (reduce risk, choppy conditions)
+- High volatility + uncertain = 0.4
+- Extreme volatility / news = 0.2 (minimal risk)"""
+
+            response = self._model.generate_content([prompt, image])
+
+            if response and response.text:
+                return self._parse_regime_response(response.text)
+            else:
+                return self._fallback_regime_analysis(df)
+
+        except Exception as e:
+            logger.error(f"AI regime analysis failed: {e}")
+            return self._fallback_regime_analysis(df)
+
+    def _parse_regime_response(self, text: str) -> dict[str, Any]:
+        """Parse Gemini regime analysis response.
+
+        Args:
+            text: Raw response text.
+
+        Returns:
+            Parsed regime dict.
+        """
+        try:
+            json_str = text
+            if "```json" in text:
+                json_str = text.split("```json")[1].split("```")[0]
+            elif "```" in text:
+                json_str = text.split("```")[1].split("```")[0]
+            elif "{" in text:
+                start = text.index("{")
+                end = text.rindex("}") + 1
+                json_str = text[start:end]
+
+            data = json.loads(json_str.strip())
+
+            # Validate and clamp risk_multiplier
+            risk_mult = float(data.get("risk_multiplier", 0.8))
+            risk_mult = max(0.1, min(1.0, risk_mult))
+
+            result = {
+                "regime": data.get("regime", "normal"),
+                "volatility_level": data.get("volatility_level", "medium"),
+                "trend_strength": data.get("trend_strength", "moderate"),
+                "risk_multiplier": risk_mult,
+                "confidence": float(data.get("confidence", 50)),
+                "reasoning": data.get("reasoning", ""),
+            }
+
+            logger.info(
+                f"AI Regime: {result['regime']} | "
+                f"Vol={result['volatility_level']} | "
+                f"Trend={result['trend_strength']} | "
+                f"Risk×{result['risk_multiplier']:.1f}"
+            )
+            return result
+
+        except (json.JSONDecodeError, KeyError, ValueError) as e:
+            logger.warning(f"Failed to parse regime response: {e}")
+            return {"regime": "normal", "volatility_level": "medium",
+                    "trend_strength": "moderate", "risk_multiplier": 0.8,
+                    "reasoning": "Parse failed, using conservative default"}
+
+    def _fallback_regime_analysis(self, df: pd.DataFrame) -> dict[str, Any]:
+        """Indicator-based regime analysis when AI is unavailable.
+
+        Uses ATR, ADX, and Bollinger Band width to determine regime.
+
+        Args:
+            df: DataFrame with indicators.
+
+        Returns:
+            Regime dict based on technical indicators.
+        """
+        regime = "normal"
+        volatility = "medium"
+        trend_strength = "moderate"
+        risk_mult = 0.8
+
+        if df is None or df.empty:
+            return {"regime": regime, "volatility_level": volatility,
+                    "trend_strength": trend_strength, "risk_multiplier": risk_mult,
+                    "reasoning": "No data available"}
+
+        # ATR-based volatility detection
+        if "atr" in df.columns:
+            atr = float(df["atr"].iloc[-1])
+            close = float(df["close"].iloc[-1])
+            atr_pct = (atr / close) * 100 if close > 0 else 0
+
+            if atr_pct > 2.0:
+                volatility = "extreme"
+            elif atr_pct > 1.0:
+                volatility = "high"
+            elif atr_pct > 0.5:
+                volatility = "medium"
+            else:
+                volatility = "low"
+
+        # ADX-based trend detection
+        if "adx" in df.columns:
+            adx = float(df["adx"].iloc[-1])
+            if adx > 40:
+                trend_strength = "strong"
+                regime = "trending"
+            elif adx > 25:
+                trend_strength = "moderate"
+                regime = "trending"
+            else:
+                trend_strength = "weak"
+                regime = "ranging"
+
+        # Calculate risk multiplier
+        if regime == "trending" and volatility in ("low", "medium"):
+            risk_mult = 1.0
+        elif regime == "trending":
+            risk_mult = 0.8
+        elif regime == "ranging" and volatility == "low":
+            risk_mult = 0.6
+        elif volatility == "extreme":
+            risk_mult = 0.3
+        elif volatility == "high":
+            risk_mult = 0.5
+        else:
+            risk_mult = 0.6
+
+        reasoning = (
+            f"Indicator-based: ADX→{trend_strength} trend, "
+            f"ATR→{volatility} volatility"
+        )
+
+        logger.info(
+            f"Fallback Regime: {regime} | Vol={volatility} | "
+            f"Trend={trend_strength} | Risk×{risk_mult:.1f}"
+        )
+
+        return {
+            "regime": regime,
+            "volatility_level": volatility,
+            "trend_strength": trend_strength,
+            "risk_multiplier": risk_mult,
+            "reasoning": reasoning,
+        }
 
     def save_chart(self, image_bytes: bytes, filename: str, output_dir: str = "data/charts") -> str:
         """Save chart image to file.

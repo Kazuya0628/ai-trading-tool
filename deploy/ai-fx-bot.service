@@ -1,0 +1,28 @@
+[Unit]
+Description=AI FX Trading Bot - Paper Trading Daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=%i
+WorkingDirectory=/opt/ai-fx-bot
+ExecStart=/opt/ai-fx-bot/venv/bin/python main.py
+Restart=always
+RestartSec=30
+
+# Environment
+EnvironmentFile=/opt/ai-fx-bot/.env
+
+# Logging (stdout/stderr -> journald)
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ai-fx-bot
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/opt/ai-fx-bot/logs /opt/ai-fx-bot/data
+
+[Install]
+WantedBy=multi-user.target

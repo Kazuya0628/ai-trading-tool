@@ -1,5 +1,4 @@
-# IG Securities API
-trading-ig>=0.0.22
+# OANDA API (uses requests directly)
 requests>=2.31.0
 
 # Data Processing
@@ -13,12 +12,15 @@ xgboost>=2.0.0
 google-generativeai>=0.8.0
 
 # Chart Generation (for AI visual analysis)
-mplfinance>=0.12.10
+mplfinance>=0.12.9b7
 matplotlib>=3.8.0
 Pillow>=10.0.0
 
 # Backtesting
 vectorbt>=0.26.0
+
+# Historical Data Download
+yfinance>=0.2.0
 
 # Utilities
 python-dotenv>=1.0.0

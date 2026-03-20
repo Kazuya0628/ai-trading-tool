@@ -1,6 +1,6 @@
 """Market data collection and management module.
 
-Fetches, stores, and manages OHLCV data from IG Securities
+Fetches, stores, and manages OHLCV data from OANDA
 for multiple timeframes and currency pairs.
 """
 
@@ -17,14 +17,14 @@ from loguru import logger
 class MarketDataManager:
     """Manage market data collection and caching for FX pairs."""
 
-    def __init__(self, ig_client: Any, data_dir: str = "data") -> None:
+    def __init__(self, broker_client: Any, data_dir: str = "data") -> None:
         """Initialize MarketDataManager.
 
         Args:
-            ig_client: IGClient instance for data retrieval.
+            broker_client: OandaClient instance for data retrieval.
             data_dir: Directory for data caching.
         """
-        self.ig_client = ig_client
+        self.broker_client = broker_client
         self.data_dir = Path(data_dir)
         self.data_dir.mkdir(parents=True, exist_ok=True)
         (self.data_dir / "raw").mkdir(exist_ok=True)
@@ -35,7 +35,7 @@ class MarketDataManager:
 
     def fetch_prices(
         self,
-        epic: str,
+        instrument: str,
         resolution: str = "HOUR_4",
         num_points: int = 500,
         use_cache: bool = True,
@@ -43,7 +43,7 @@ class MarketDataManager:
         """Fetch OHLCV price data for a market.
 
         Args:
-            epic: IG market epic identifier.
+            instrument: OANDA instrument (e.g., 'USD_JPY').
             resolution: Candle resolution.
             num_points: Number of data points.
             use_cache: Whether to use cached data.
@@ -51,7 +51,7 @@ class MarketDataManager:
         Returns:
             DataFrame with OHLCV data.
         """
-        cache_key = f"{epic}_{resolution}_{num_points}"
+        cache_key = f"{instrument}_{resolution}_{num_points}"
 
         if use_cache and cache_key in self._cache:
             cached = self._cache[cache_key]
@@ -60,25 +60,25 @@ class MarketDataManager:
                 if (datetime.now() - cached._fetch_time).seconds < 300:
                     return cached
 
-        df = self.ig_client.get_historical_prices(epic, resolution, num_points)
+        df = self.broker_client.get_historical_prices(instrument, resolution, num_points)
 
         if not df.empty:
             df._fetch_time = datetime.now()  # type: ignore
             self._cache[cache_key] = df
-            logger.debug(f"Fetched {len(df)} bars for {epic} ({resolution})")
+            logger.debug(f"Fetched {len(df)} bars for {instrument} ({resolution})")
 
         return df
 
     def fetch_multi_timeframe(
         self,
-        epic: str,
+        instrument: str,
         timeframes: dict[str, str],
         num_points: int = 500,
     ) -> dict[str, pd.DataFrame]:
         """Fetch data across multiple timeframes.
 
         Args:
-            epic: Market epic.
+            instrument: OANDA instrument.
             timeframes: Dict of name->resolution (e.g., {'primary': 'HOUR_4'}).
             num_points: Data points per timeframe.
 
@@ -87,11 +87,11 @@ class MarketDataManager:
         """
         result = {}
         for name, resolution in timeframes.items():
-            df = self.fetch_prices(epic, resolution, num_points)
+            df = self.fetch_prices(instrument, resolution, num_points)
             if not df.empty:
                 result[name] = df
             else:
-                logger.warning(f"No data for {epic} at {resolution}")
+                logger.warning(f"No data for {instrument} at {resolution}")
         return result
 
     def save_to_csv(self, df: pd.DataFrame, filename: str) -> str:
@@ -125,16 +125,16 @@ class MarketDataManager:
             return df
         return pd.DataFrame()
 
-    def get_latest_price(self, epic: str) -> dict[str, float]:
+    def get_latest_price(self, instrument: str) -> dict[str, float]:
         """Get the latest bid/offer price for a market.
 
         Args:
-            epic: Market epic.
+            instrument: OANDA instrument.
 
         Returns:
             Dictionary with bid, offer, mid, spread.
         """
-        info = self.ig_client.get_market_info(epic)
+        info = self.broker_client.get_market_info(instrument)
         if info:
             bid = info.get("bid", 0)
             offer = info.get("offer", 0)

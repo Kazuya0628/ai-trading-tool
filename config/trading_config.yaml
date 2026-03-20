@@ -7,42 +7,44 @@
 # - AI visual chart analysis using Gemini
 # - Systematic backtesting with 3+ years data
 # - Risk management with strict stop-loss
+#
+# Data Source: OANDA v20 API (Practice Account)
 
 # ============================================
-# Trading Pairs (IG Securities EPICs)
+# Trading Pairs (OANDA Instruments)
 # ============================================
 trading:
   pairs:
-    - epic: "CS.D.USDJPY.TODAY.IP"
+    - instrument: "USD_JPY"
       name: "USD/JPY"
       min_lot: 1.0
       pip_value: 0.01
-    - epic: "CS.D.EURUSD.TODAY.IP"
+    - instrument: "EUR_USD"
       name: "EUR/USD"
       min_lot: 1.0
       pip_value: 0.0001
-    - epic: "CS.D.GBPUSD.TODAY.IP"
+    - instrument: "GBP_USD"
       name: "GBP/USD"
       min_lot: 1.0
       pip_value: 0.0001
-    - epic: "CS.D.EURJPY.TODAY.IP"
+    - instrument: "EUR_JPY"
       name: "EUR/JPY"
       min_lot: 1.0
       pip_value: 0.01
-    - epic: "CS.D.GBPJPY.TODAY.IP"
+    - instrument: "GBP_JPY"
       name: "GBP/JPY"
       min_lot: 1.0
       pip_value: 0.01
-    - epic: "CS.D.AUDUSD.TODAY.IP"
+    - instrument: "AUD_USD"
       name: "AUD/USD"
       min_lot: 1.0
       pip_value: 0.0001
 
   # Active pairs to trade (subset of above)
   active_pairs:
-    - "CS.D.USDJPY.TODAY.IP"
-    - "CS.D.EURUSD.TODAY.IP"
-    - "CS.D.GBPJPY.TODAY.IP"
+    - "USD_JPY"
+    - "EUR_USD"
+    - "GBP_JPY"
 
 # ============================================
 # Timeframe Configuration (Multi-Timeframe)
@@ -53,9 +55,10 @@ timeframes:
   secondary: "HOUR"       # 1-hour chart for entry timing
   trend: "DAY"            # Daily chart for overall trend
 
-  # Available: SECOND, MINUTE, MINUTE_2, MINUTE_3, MINUTE_5,
-  # MINUTE_10, MINUTE_15, MINUTE_30, HOUR, HOUR_2, HOUR_3,
-  # HOUR_4, DAY, WEEK, MONTH
+  # Available (IG-style names mapped to OANDA granularities):
+  # MINUTE, MINUTE_5, MINUTE_15, MINUTE_30,
+  # HOUR, HOUR_2, HOUR_3, HOUR_4, DAY, WEEK, MONTH
+  # Or use OANDA native: M1, M5, M15, M30, H1, H2, H3, H4, D, W, M
 
 # ============================================
 # AI Pattern Recognition Settings
@@ -178,6 +181,9 @@ risk_management:
   min_stop_loss_pips: 10
   max_stop_loss_pips: 100
 
+  # Risk:Reward filter
+  min_risk_reward_ratio: 0.5       # Minimum R:R to accept signal
+
   # Take Profit
   take_profit_rr_ratio: 2.0        # TP = 2:1 reward:risk ratio
   trailing_stop_enabled: true
@@ -192,6 +198,21 @@ risk_management:
   max_drawdown_pct: 10.0           # Stop all trading if drawdown > 10%
   drawdown_cooldown_hours: 24
 
+  # Adaptive Risk Control (AI-driven dynamic adjustment)
+  adaptive:
+    performance_window: 20           # Rolling window of recent trades
+    loss_scale_factor: 0.75          # Risk × 0.75 per consecutive loss
+    min_loss_scale: 0.25             # Floor: never below 25% of base risk
+    max_consecutive_losses: 5        # Force cooldown after 5 consecutive losses
+    pattern_disable_win_rate: 0.25   # Disable patterns with <25% win rate
+    drawdown_thresholds:             # Progressive risk reduction
+      - dd_pct: 3.0
+        scale: 0.75                  # DD 3%+ → risk × 0.75
+      - dd_pct: 5.0
+        scale: 0.50                  # DD 5%+ → risk × 0.50
+      - dd_pct: 7.0
+        scale: 0.25                  # DD 7%+ → risk × 0.25
+
 # ============================================
 # Backtesting Configuration
 # ============================================
@@ -199,7 +220,7 @@ backtesting:
   # Data period (AI Sennin recommends 3+ years)
   lookback_years: 3
   initial_capital: 1000000         # 100万円
-  commission_per_trade: 0.0        # IG spread is included
+  commission_per_trade: 0.0        # Spread is included
   slippage_pips: 0.5
 
   # Walk-forward optimization
@@ -226,9 +247,6 @@ execution:
     start: "00:00"                 # FX is 24h but can restrict
     end: "23:59"
   avoid_news_minutes: 30           # Avoid trading 30 min around news
-
-  # Session management
-  session_refresh_minutes: 55      # Refresh IG session before 60min timeout
 
 # ============================================
 # Logging

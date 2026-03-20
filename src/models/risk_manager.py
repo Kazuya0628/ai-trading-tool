@@ -6,10 +6,12 @@ Implements strict risk controls following AI Sennin's principles:
 - Maximum drawdown protection
 - Daily loss limits
 - Position sizing based on risk
+- Adaptive risk scaling based on performance and market regime
 """
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any
@@ -48,6 +50,247 @@ class RiskState:
     halt_reason: str = ""
 
 
+@dataclass
+class MarketRegime:
+    """AI-determined market regime for adaptive risk adjustment."""
+    regime: str = "normal"  # normal, trending, volatile, ranging, uncertain
+    volatility_level: str = "medium"  # low, medium, high, extreme
+    trend_strength: str = "moderate"  # weak, moderate, strong
+    risk_multiplier: float = 1.0  # 0.0〜1.0, applied to position sizing
+    confidence: float = 50.0
+    reasoning: str = ""
+
+
+class PerformanceTracker:
+    """Track recent trade performance for adaptive risk decisions.
+
+    Maintains a rolling window of trade results to detect
+    losing streaks, win rate trends, and performance degradation.
+    """
+
+    def __init__(self, window_size: int = 20) -> None:
+        """Initialize performance tracker.
+
+        Args:
+            window_size: Number of recent trades to track.
+        """
+        self.window_size = window_size
+        self._results: deque[dict[str, Any]] = deque(maxlen=window_size)
+        self.consecutive_losses: int = 0
+        self.consecutive_wins: int = 0
+        self.total_trades: int = 0
+
+    def record(self, pnl: float, pattern: str = "", instrument: str = "") -> None:
+        """Record a trade result.
+
+        Args:
+            pnl: Profit/loss amount.
+            pattern: Pattern type that generated the signal.
+            instrument: Currency pair.
+        """
+        is_win = pnl > 0
+        self._results.append({
+            "pnl": pnl,
+            "is_win": is_win,
+            "pattern": pattern,
+            "instrument": instrument,
+            "timestamp": datetime.now().isoformat(),
+        })
+        self.total_trades += 1
+
+        if is_win:
+            self.consecutive_wins += 1
+            self.consecutive_losses = 0
+        else:
+            self.consecutive_losses += 1
+            self.consecutive_wins = 0
+
+    @property
+    def recent_win_rate(self) -> float:
+        """Calculate win rate over the rolling window."""
+        if not self._results:
+            return 0.5  # Default assumption
+        wins = sum(1 for r in self._results if r["is_win"])
+        return wins / len(self._results)
+
+    @property
+    def recent_pnl(self) -> float:
+        """Total P&L over the rolling window."""
+        return sum(r["pnl"] for r in self._results)
+
+    @property
+    def recent_avg_pnl(self) -> float:
+        """Average P&L per trade over the rolling window."""
+        if not self._results:
+            return 0.0
+        return self.recent_pnl / len(self._results)
+
+    def pattern_win_rate(self, pattern: str) -> float:
+        """Win rate for a specific pattern type.
+
+        Args:
+            pattern: Pattern type name.
+
+        Returns:
+            Win rate (0.0-1.0), or 0.5 if insufficient data.
+        """
+        pattern_trades = [r for r in self._results if r["pattern"] == pattern]
+        if len(pattern_trades) < 3:
+            return 0.5  # Insufficient data
+        wins = sum(1 for r in pattern_trades if r["is_win"])
+        return wins / len(pattern_trades)
+
+
+class AdaptiveRiskController:
+    """AI-driven adaptive risk adjustment.
+
+    Dynamically scales risk based on:
+    1. Recent performance (consecutive losses → reduce size)
+    2. Drawdown progression (deeper DD → smaller positions)
+    3. Market regime (AI-detected volatility/trend state)
+    4. Pattern-specific performance (disable underperforming patterns)
+    """
+
+    def __init__(self, config: dict | None = None) -> None:
+        """Initialize adaptive risk controller.
+
+        Args:
+            config: Adaptive risk configuration.
+        """
+        self.config = config or {}
+        self.tracker = PerformanceTracker(
+            window_size=self.config.get("performance_window", 20)
+        )
+        self.market_regime = MarketRegime()
+
+        # Consecutive loss scaling: risk reduces by this factor per loss
+        self._loss_scale_factor = self.config.get("loss_scale_factor", 0.75)
+        # Maximum reduction from consecutive losses (floor)
+        self._min_loss_scale = self.config.get("min_loss_scale", 0.25)
+        # Max consecutive losses before forced cooldown
+        self._max_consecutive_losses = self.config.get("max_consecutive_losses", 5)
+
+        # Drawdown-based scaling thresholds
+        self._dd_thresholds = self.config.get("drawdown_thresholds", [
+            {"dd_pct": 3.0, "scale": 0.75},
+            {"dd_pct": 5.0, "scale": 0.50},
+            {"dd_pct": 7.0, "scale": 0.25},
+        ])
+
+        # Pattern disable threshold
+        self._pattern_disable_wr = self.config.get("pattern_disable_win_rate", 0.25)
+
+    def calculate_risk_multiplier(self, current_drawdown_pct: float) -> float:
+        """Calculate overall risk multiplier based on all adaptive factors.
+
+        Args:
+            current_drawdown_pct: Current drawdown percentage.
+
+        Returns:
+            Risk multiplier (0.0-1.0) to apply to base position size.
+        """
+        # Factor 1: Consecutive loss scaling
+        loss_scale = self._consecutive_loss_scale()
+
+        # Factor 2: Drawdown-based scaling
+        dd_scale = self._drawdown_scale(current_drawdown_pct)
+
+        # Factor 3: Market regime (from AI)
+        regime_scale = self.market_regime.risk_multiplier
+
+        # Factor 4: Recent win rate momentum
+        wr_scale = self._win_rate_scale()
+
+        # Combined multiplier (multiplicative — all factors stack)
+        combined = loss_scale * dd_scale * regime_scale * wr_scale
+        combined = max(combined, 0.1)  # Never go below 10% of base risk
+        combined = min(combined, 1.0)  # Never exceed base risk
+
+        logger.info(
+            f"Adaptive risk: loss={loss_scale:.2f} × dd={dd_scale:.2f} × "
+            f"regime={regime_scale:.2f} × wr={wr_scale:.2f} = {combined:.2f}"
+        )
+
+        return round(combined, 2)
+
+    def should_skip_pattern(self, pattern: str) -> tuple[bool, str]:
+        """Check if a pattern should be skipped due to poor performance.
+
+        Args:
+            pattern: Pattern type name.
+
+        Returns:
+            Tuple of (should_skip, reason).
+        """
+        wr = self.tracker.pattern_win_rate(pattern)
+        if wr < self._pattern_disable_wr:
+            return True, (
+                f"Pattern '{pattern}' disabled: win rate {wr:.0%} "
+                f"< {self._pattern_disable_wr:.0%} threshold"
+            )
+        return False, ""
+
+    def should_cooldown(self) -> tuple[bool, str]:
+        """Check if a forced cooldown is needed due to consecutive losses.
+
+        Returns:
+            Tuple of (should_cooldown, reason).
+        """
+        if self.tracker.consecutive_losses >= self._max_consecutive_losses:
+            return True, (
+                f"Forced cooldown: {self.tracker.consecutive_losses} "
+                f"consecutive losses (max={self._max_consecutive_losses})"
+            )
+        return False, ""
+
+    def _consecutive_loss_scale(self) -> float:
+        """Scale based on consecutive losses."""
+        losses = self.tracker.consecutive_losses
+        if losses == 0:
+            return 1.0
+        scale = self._loss_scale_factor ** losses
+        return max(scale, self._min_loss_scale)
+
+    def _drawdown_scale(self, dd_pct: float) -> float:
+        """Scale based on drawdown depth."""
+        scale = 1.0
+        for threshold in self._dd_thresholds:
+            if dd_pct >= threshold["dd_pct"]:
+                scale = threshold["scale"]
+        return scale
+
+    def _win_rate_scale(self) -> float:
+        """Scale based on recent win rate trend."""
+        if self.tracker.total_trades < 5:
+            return 1.0  # Insufficient data, use full risk
+        wr = self.tracker.recent_win_rate
+        if wr >= 0.55:
+            return 1.0  # Performing well, full size
+        elif wr >= 0.40:
+            return 0.85  # Slightly below par
+        elif wr >= 0.30:
+            return 0.65  # Underperforming
+        else:
+            return 0.50  # Poor performance, halve risk
+
+    def get_summary(self) -> dict[str, Any]:
+        """Get adaptive risk state summary.
+
+        Returns:
+            Dictionary of adaptive risk metrics.
+        """
+        return {
+            "total_trades": self.tracker.total_trades,
+            "consecutive_losses": self.tracker.consecutive_losses,
+            "consecutive_wins": self.tracker.consecutive_wins,
+            "recent_win_rate": f"{self.tracker.recent_win_rate:.0%}",
+            "recent_avg_pnl": f"{self.tracker.recent_avg_pnl:+,.0f}",
+            "market_regime": self.market_regime.regime,
+            "volatility": self.market_regime.volatility_level,
+            "regime_risk_multiplier": self.market_regime.risk_multiplier,
+        }
+
+
 class RiskManager:
     """Manage trading risk and position sizing.
 
@@ -56,6 +299,7 @@ class RiskManager:
     - A 35% win rate is fine with good R:R (e.g., 2:1)
     - Incremental exposure, never all-in
     - Math over luck: systematic risk control
+    - Adaptive sizing: reduce risk in adverse conditions
     """
 
     def __init__(self, config: dict | None = None) -> None:
@@ -83,6 +327,11 @@ class RiskManager:
         self.max_weekly_loss_pct = self.config.get("max_weekly_loss_pct", 5.0)
         self.max_drawdown_pct = self.config.get("max_drawdown_pct", 10.0)
         self.drawdown_cooldown_hrs = self.config.get("drawdown_cooldown_hours", 24)
+
+        # Adaptive risk controller
+        self.adaptive = AdaptiveRiskController(
+            self.config.get("adaptive", {})
+        )
 
     # --------------------------------------------------
     # Pre-Trade Checks
@@ -163,8 +412,9 @@ class RiskManager:
             return False, f"Low confidence: {signal.confidence:.0f}% < 60%"
 
         # Minimum R:R ratio
-        if signal.risk_reward_ratio < 1.5:
-            return False, f"Poor R:R: {signal.risk_reward_ratio:.1f} < 1.5"
+        min_rr = self.config.get("min_risk_reward_ratio", 1.0)
+        if signal.risk_reward_ratio < min_rr:
+            return False, f"Poor R:R: {signal.risk_reward_ratio:.1f} < {min_rr}"
 
         # Stop-loss validation
         if signal.stop_loss <= 0:
@@ -211,8 +461,14 @@ class RiskManager:
         Returns:
             PositionSize with calculated lots.
         """
+        # Apply adaptive risk multiplier
+        adaptive_mult = self.adaptive.calculate_risk_multiplier(
+            self.state.current_drawdown_pct
+        )
+        adjusted_risk_pct = self.risk_per_trade_pct * adaptive_mult
+
         # Calculate risk amount
-        risk_amount = account_balance * self.risk_per_trade_pct / 100
+        risk_amount = account_balance * adjusted_risk_pct / 100
 
         # Calculate stop distance in pips
         stop_distance = abs(signal.entry_price - signal.stop_loss)
@@ -241,7 +497,7 @@ class RiskManager:
             stop_distance_pips=stop_distance_pips,
             pip_value=pip_value,
             account_balance=account_balance,
-            risk_pct=self.risk_per_trade_pct,
+            risk_pct=adjusted_risk_pct,
         )
 
     def calculate_stop_loss(
@@ -334,19 +590,29 @@ class RiskManager:
     # State Tracking
     # --------------------------------------------------
 
-    def record_trade_result(self, pnl: float) -> None:
-        """Record a trade result for risk tracking.
+    def record_trade_result(
+        self, pnl: float, pattern: str = "", instrument: str = ""
+    ) -> None:
+        """Record a trade result for risk tracking and adaptive analysis.
 
         Args:
             pnl: Profit/loss from the trade.
+            pattern: Pattern type that generated the signal.
+            instrument: Currency pair.
         """
         self.state.daily_pnl += pnl
         self.state.weekly_pnl += pnl
         self.state.daily_trade_count += 1
+
+        # Feed into adaptive performance tracker
+        self.adaptive.tracker.record(pnl, pattern, instrument)
+
         logger.info(
             f"Trade recorded: PnL={pnl:+.2f}, "
             f"Daily PnL={self.state.daily_pnl:+.2f}, "
-            f"Trades today={self.state.daily_trade_count}"
+            f"Trades today={self.state.daily_trade_count}, "
+            f"Streak: {'W' if pnl > 0 else 'L'}"
+            f"{self.adaptive.tracker.consecutive_wins if pnl > 0 else self.adaptive.tracker.consecutive_losses}"
         )
 
     def update_open_positions(self, count: int) -> None:
@@ -398,4 +664,5 @@ class RiskManager:
             "open_positions": self.state.open_position_count,
             "max_daily_loss_pct": self.max_daily_loss_pct,
             "max_drawdown_pct": self.max_drawdown_pct,
+            "adaptive": self.adaptive.get_summary(),
         }

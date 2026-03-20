@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """AI FX Trading Tool - Main Entry Point.
 
+Data Source: OANDA v20 API
+Trading Mode: Paper trading (analysis & simulation only)
+
 Usage:
     python main.py                  # Start trading bot (paper mode)
-    python main.py --live           # Start in live mode
     python main.py --backtest       # Run backtest
     python main.py --status         # Check account status
-    python main.py --analyze EPIC   # Analyze a specific pair
+    python main.py --analyze USD_JPY  # Analyze a specific pair
 """
 
 import argparse
@@ -24,18 +26,16 @@ from loguru import logger
 def main() -> None:
     """Main entry point for the AI FX Trading Tool."""
     parser = argparse.ArgumentParser(
-        description="AI FX Trading Tool - IG Securities Automated Trading",
+        description="AI FX Trading Tool - OANDA Market Data + Paper Trading",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
   python main.py                     Start in paper trading mode
-  python main.py --live              Start in live trading mode
   python main.py --backtest          Run backtest on all active pairs
-  python main.py --backtest --epic CS.D.USDJPY.TODAY.IP
+  python main.py --backtest --instrument USD_JPY
                                      Run backtest on specific pair
   python main.py --status            Show account status
-  python main.py --analyze CS.D.USDJPY.TODAY.IP
-                                     Analyze a specific pair
+  python main.py --analyze USD_JPY   Analyze a specific pair
         """,
     )
 
@@ -44,20 +44,33 @@ Examples:
         help="Path to trading_config.yaml",
     )
     parser.add_argument(
-        "--live", action="store_true",
-        help="Enable live trading mode (USE WITH CAUTION)",
-    )
-    parser.add_argument(
         "--backtest", action="store_true",
         help="Run backtest instead of live trading",
     )
     parser.add_argument(
+        "--instrument", type=str, default=None,
+        help="Specific instrument for backtest/analysis (e.g., USD_JPY)",
+    )
+    # Keep --epic as alias for backward compatibility
+    parser.add_argument(
         "--epic", type=str, default=None,
-        help="Specific epic for backtest/analysis",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--resolution", type=str, default="HOUR_4",
         help="Data resolution for backtest (default: HOUR_4)",
+    )
+    parser.add_argument(
+        "--csv", type=str, default=None,
+        help="Path to CSV file for backtest (overrides API data)",
+    )
+    parser.add_argument(
+        "--download", action="store_true",
+        help="Download multi-year historical data via yfinance for backtest",
+    )
+    parser.add_argument(
+        "--years", type=int, default=2,
+        help="Years of data to download (default: 2, max 2 for 4h data)",
     )
     parser.add_argument(
         "--status", action="store_true",
@@ -65,41 +78,33 @@ Examples:
     )
     parser.add_argument(
         "--analyze", type=str, default=None,
-        help="Analyze a specific epic and show signals",
+        help="Analyze a specific instrument and show signals (e.g., USD_JPY)",
     )
 
     args = parser.parse_args()
 
+    # Handle --epic alias
+    instrument = args.instrument or args.epic
+
     # Initialize bot
     bot = TradingBot(config_path=args.config)
-
-    if args.live:
-        logger.warning("=" * 60)
-        logger.warning("  ⚠️  LIVE TRADING MODE ENABLED  ⚠️")
-        logger.warning("  Real money will be used for trades!")
-        logger.warning("=" * 60)
-
-        confirm = input("Type 'CONFIRM' to proceed with live trading: ")
-        if confirm != "CONFIRM":
-            logger.info("Live trading cancelled.")
-            return
 
     # Execute mode
     if args.status:
         _show_status(bot)
     elif args.backtest:
-        _run_backtest(bot, args.epic, args.resolution)
+        _run_backtest(bot, instrument, args.resolution, args.csv, args.download, args.years)
     elif args.analyze:
         _analyze_pair(bot, args.analyze)
     else:
-        # Start trading bot
+        # Start trading bot (paper mode)
         bot.start()
 
 
 def _show_status(bot: TradingBot) -> None:
     """Show account status."""
-    if not bot.ig_client.connect():
-        logger.error("Failed to connect")
+    if not bot.broker.connect():
+        logger.error("Failed to connect to OANDA")
         return
 
     status = bot.get_status()
@@ -108,11 +113,11 @@ def _show_status(bot: TradingBot) -> None:
     print("=" * 50)
 
     account = status.get("account", {})
-    print(f"\n  Account: {account.get('account_name', 'N/A')}")
+    print(f"\n  Data Source: {status.get('data_source', 'N/A')}")
+    print(f"  Account: {account.get('account_name', 'N/A')}")
     print(f"  Balance: ¥{account.get('balance', 0):,.0f}")
     print(f"  P&L:     ¥{account.get('profit_loss', 0):+,.0f}")
     print(f"  Available: ¥{account.get('available', 0):,.0f}")
-    print(f"  Type:    {status.get('account_type', 'N/A')}")
 
     risk = status.get("risk", {})
     print(f"\n  Daily P&L:    ¥{risk.get('daily_pnl', 0):+,.0f}")
@@ -123,38 +128,66 @@ def _show_status(bot: TradingBot) -> None:
     print(f"\n  Active Pairs: {', '.join(status.get('active_pairs', []))}")
     print("=" * 50 + "\n")
 
-    bot.ig_client.disconnect()
+    bot.broker.disconnect()
 
 
-def _run_backtest(bot: TradingBot, epic: str | None, resolution: str) -> None:
-    """Run backtest."""
-    if epic:
-        epics = [epic]
+def _run_backtest(
+    bot: TradingBot,
+    instrument: str | None,
+    resolution: str,
+    csv_path: str | None = None,
+    download: bool = False,
+    years: int = 2,
+) -> None:
+    """Run backtest with optional CSV/download data source."""
+    from src.data.csv_loader import download_forex_data, load_csv, load_or_download
+
+    if instrument:
+        instruments = [instrument]
     else:
-        epics = bot.config.active_pairs
+        instruments = bot.config.active_pairs
 
-    for e in epics:
-        print(f"\n{'='*50}")
-        print(f"  Backtest: {e} ({resolution})")
-        print(f"{'='*50}")
-        result = bot.run_backtest(e, resolution)
+    for inst in instruments:
+        # Determine data source
+        external_df = None
+
+        if csv_path:
+            # User-provided CSV file
+            print(f"\n  Loading CSV: {csv_path}")
+            external_df = load_csv(csv_path)
+        elif download:
+            # Download from yfinance
+            external_df = load_or_download(inst, interval=resolution.lower().replace("hour_", "") + "h" if "HOUR" in resolution else "1d", years=years)
+
+        if external_df is not None and not external_df.empty:
+            print(f"\n{'='*50}")
+            print(f"  Backtest: {inst} ({resolution}) — {len(external_df)} candles")
+            print(f"  Period: {external_df.index[0].strftime('%Y-%m-%d')} → {external_df.index[-1].strftime('%Y-%m-%d')}")
+            print(f"{'='*50}")
+            result = bot.run_backtest(inst, resolution, external_df=external_df)
+        else:
+            print(f"\n{'='*50}")
+            print(f"  Backtest: {inst} ({resolution})")
+            print(f"{'='*50}")
+            result = bot.run_backtest(inst, resolution)
+
         if result:
             print(json.dumps(result, indent=2))
 
-    bot.ig_client.disconnect()
+    bot.broker.disconnect()
 
 
-def _analyze_pair(bot: TradingBot, epic: str) -> None:
+def _analyze_pair(bot: TradingBot, instrument: str) -> None:
     """Analyze a specific currency pair."""
-    if not bot.ig_client.connect():
-        logger.error("Failed to connect")
+    if not bot.broker.connect():
+        logger.error("Failed to connect to OANDA")
         return
 
-    pair_config = bot.config.pair_configs.get(epic, {})
-    pair_name = pair_config.get("name", epic)
+    pair_config = bot.config.pair_configs.get(instrument, {})
+    pair_name = pair_config.get("name", instrument)
 
     print(f"\n{'='*50}")
-    print(f"  Analysis: {pair_name} ({epic})")
+    print(f"  Analysis: {pair_name} ({instrument})")
     print(f"{'='*50}")
 
     # Fetch data
@@ -163,7 +196,7 @@ def _analyze_pair(bot: TradingBot, epic: str) -> None:
     for tf_name in ["primary", "secondary", "trend"]:
         resolution = timeframe_config.get(tf_name)
         if resolution:
-            df = bot.data_manager.fetch_prices(epic, resolution, num_points=500)
+            df = bot.data_manager.fetch_prices(instrument, resolution, num_points=500)
             if not df.empty:
                 df = bot.tech_analyzer.add_all_indicators(df)
                 mtf_data[tf_name] = df
@@ -171,12 +204,12 @@ def _analyze_pair(bot: TradingBot, epic: str) -> None:
 
     if "primary" not in mtf_data:
         print("  No data available")
-        bot.ig_client.disconnect()
+        bot.broker.disconnect()
         return
 
     # Run analysis
     signals = bot.strategy_engine.analyze(
-        epic=epic,
+        epic=instrument,
         pair_name=pair_name,
         mtf_data=mtf_data,
         timeframe_config=timeframe_config,
@@ -192,7 +225,7 @@ def _analyze_pair(bot: TradingBot, epic: str) -> None:
         print("\n  No signals detected")
 
     # Market info
-    info = bot.ig_client.get_market_info(epic)
+    info = bot.broker.get_market_info(instrument)
     if info:
         print(f"\n  Market Status:")
         print(f"    Bid:    {info.get('bid', 0):.5f}")
@@ -201,7 +234,7 @@ def _analyze_pair(bot: TradingBot, epic: str) -> None:
         print(f"    Status: {info.get('market_status', 'N/A')}")
 
     print(f"\n{'='*50}\n")
-    bot.ig_client.disconnect()
+    bot.broker.disconnect()
 
 
 if __name__ == "__main__":

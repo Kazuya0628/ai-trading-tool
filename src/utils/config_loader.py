@@ -20,7 +20,7 @@ def load_config(config_path: str | None = None) -> dict[str, Any]:
     """
     if config_path is None:
         config_path = str(
-            Path(__file__).parent.parent / "config" / "trading_config.yaml"
+            Path(__file__).parent.parent.parent / "config" / "trading_config.yaml"
         )
 
     with open(config_path, "r", encoding="utf-8") as f:
@@ -36,27 +36,63 @@ def load_env() -> dict[str, str]:
     Returns:
         Dictionary of environment variables.
     """
-    env_path = Path(__file__).parent.parent / ".env"
+    env_path = Path(__file__).parent.parent.parent / ".env"
     load_dotenv(env_path)
 
     env_vars = {
-        "IG_API_KEY": os.getenv("IG_API_KEY", ""),
-        "IG_USERNAME": os.getenv("IG_USERNAME", ""),
-        "IG_PASSWORD": os.getenv("IG_PASSWORD", ""),
-        "IG_ACC_TYPE": os.getenv("IG_ACC_TYPE", "DEMO"),
-        "IG_ACC_NUMBER": os.getenv("IG_ACC_NUMBER", ""),
+        # Data source selection
+        "DATA_SOURCE": os.getenv("DATA_SOURCE", "twelvedata"),
+        # Twelve Data
+        "TWELVEDATA_API_KEY": os.getenv("TWELVEDATA_API_KEY", ""),
+        # OANDA (for future use)
+        "OANDA_API_TOKEN": os.getenv("OANDA_API_TOKEN", ""),
+        "OANDA_ACCOUNT_ID": os.getenv("OANDA_ACCOUNT_ID", ""),
+        "OANDA_ENVIRONMENT": os.getenv("OANDA_ENVIRONMENT", "practice"),
+        # AI
         "GEMINI_API_KEY": os.getenv("GEMINI_API_KEY", ""),
+        # Trading
         "TRADING_MODE": os.getenv("TRADING_MODE", "paper"),
+        # Notifications
         "DISCORD_WEBHOOK_URL": os.getenv("DISCORD_WEBHOOK_URL", ""),
         "LINE_NOTIFY_TOKEN": os.getenv("LINE_NOTIFY_TOKEN", ""),
     }
 
-    # Validate critical keys
-    missing = [k for k in ["IG_API_KEY", "IG_USERNAME", "IG_PASSWORD"] if not env_vars[k]]
-    if missing:
-        logger.warning(f"Missing environment variables: {missing}")
+    # Validate critical keys based on data source
+    data_source = env_vars["DATA_SOURCE"]
+    if data_source == "twelvedata":
+        if not env_vars["TWELVEDATA_API_KEY"]:
+            logger.warning("Missing environment variable: TWELVEDATA_API_KEY")
+    elif data_source == "oanda":
+        missing = [k for k in ["OANDA_API_TOKEN", "OANDA_ACCOUNT_ID"] if not env_vars[k]]
+        if missing:
+            logger.warning(f"Missing environment variables: {missing}")
 
     return env_vars
+
+
+def create_broker(env: dict[str, str]) -> Any:
+    """Create a broker client based on DATA_SOURCE setting.
+
+    Args:
+        env: Environment variables dictionary.
+
+    Returns:
+        Broker client instance (TwelveDataClient or OandaClient).
+    """
+    data_source = env.get("DATA_SOURCE", "twelvedata")
+
+    if data_source == "oanda":
+        from src.brokers.oanda_client import OandaClient
+        return OandaClient(
+            api_token=env["OANDA_API_TOKEN"],
+            account_id=env["OANDA_ACCOUNT_ID"],
+            environment=env.get("OANDA_ENVIRONMENT", "practice"),
+        )
+    else:
+        from src.brokers.twelvedata_client import TwelveDataClient
+        return TwelveDataClient(
+            api_key=env["TWELVEDATA_API_KEY"],
+        )
 
 
 class TradingConfig:
@@ -74,6 +110,10 @@ class TradingConfig:
             logger.warning("Risk per trade > 5% is extremely dangerous!")
         if risk["max_drawdown_pct"] > 20.0:
             logger.warning("Max drawdown > 20% is very high!")
+
+    @property
+    def data_source(self) -> str:
+        return self.env.get("DATA_SOURCE", "twelvedata")
 
     @property
     def trading(self) -> dict[str, Any]:
@@ -115,13 +155,9 @@ class TradingConfig:
     def pair_configs(self) -> dict[str, dict]:
         pairs = {}
         for p in self.trading.get("pairs", []):
-            pairs[p["epic"]] = p
+            pairs[p["instrument"]] = p
         return pairs
 
     @property
     def is_live(self) -> bool:
         return self.env.get("TRADING_MODE", "paper") == "live"
-
-    @property
-    def is_demo(self) -> bool:
-        return self.env.get("IG_ACC_TYPE", "DEMO") == "DEMO"
