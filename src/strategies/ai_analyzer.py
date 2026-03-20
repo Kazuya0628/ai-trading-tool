@@ -195,11 +195,29 @@ class AIChartAnalyzer:
             # Get prompt
             prompt = self.config.get("prompt_template", self._default_prompt())
 
+            # Save chart image for audit trail
+            self._save_audit_chart(image_bytes, pair_name, timeframe, "analysis")
+
             # Call Gemini
             response = self._model.generate_content([prompt, image])
 
             if response and response.text:
-                return self._parse_ai_response(response.text, df)
+                logger.info(
+                    f"[Gemini] {pair_name} {timeframe} response: "
+                    f"{response.text[:300]}"
+                )
+                result = self._parse_ai_response(response.text, df)
+                if result.is_valid:
+                    logger.info(
+                        f"[Gemini] SIGNAL: {pair_name} {result.direction.value} "
+                        f"pattern={result.pattern.value} conf={result.confidence}% "
+                        f"entry={result.entry_price:.5f} sl={result.stop_loss:.5f} "
+                        f"tp={result.take_profit:.5f} "
+                        f"reason={result.reasoning}"
+                    )
+                else:
+                    logger.info(f"[Gemini] {pair_name}: No signal detected")
+                return result
             else:
                 logger.warning("Empty response from Gemini")
                 return PatternSignal(PatternType.NO_SIGNAL, SignalDirection.NONE, 0)
@@ -340,6 +358,9 @@ Return ONLY a JSON object:
             image_bytes = self.generate_chart_image(df, pair_name, "Regime Analysis")
             if image_bytes is None:
                 return self._fallback_regime_analysis(df)
+
+            # Save chart image for audit trail
+            self._save_audit_chart(image_bytes, pair_name, "", "regime")
 
             image = Image.open(io.BytesIO(image_bytes))
 
@@ -505,6 +526,37 @@ Risk multiplier guidelines:
             "risk_multiplier": risk_mult,
             "reasoning": reasoning,
         }
+
+    def _save_audit_chart(
+        self, image_bytes: bytes, pair_name: str, timeframe: str, analysis_type: str
+    ) -> None:
+        """Save chart image as audit trail for Gemini analysis.
+
+        Args:
+            image_bytes: PNG image bytes.
+            pair_name: Currency pair name.
+            timeframe: Chart timeframe.
+            analysis_type: 'analysis' or 'regime'.
+        """
+        try:
+            from datetime import datetime as dt
+            timestamp = dt.now().strftime("%Y%m%d_%H%M%S")
+            safe_pair = pair_name.replace("/", "_").replace(" ", "_")
+            filename = f"{timestamp}_{safe_pair}_{analysis_type}.png"
+            output_dir = Path("data/gemini_audit")
+            output_dir.mkdir(parents=True, exist_ok=True)
+            filepath = output_dir / filename
+            with open(filepath, "wb") as f:
+                f.write(image_bytes)
+            logger.info(f"[Gemini] Chart saved: {filepath}")
+
+            # Keep only last 100 audit files to prevent disk bloat
+            files = sorted(output_dir.glob("*.png"), key=lambda f: f.stat().st_mtime)
+            if len(files) > 100:
+                for old_file in files[:-100]:
+                    old_file.unlink()
+        except Exception as e:
+            logger.debug(f"Audit chart save failed (non-critical): {e}")
 
     def save_chart(self, image_bytes: bytes, filename: str, output_dir: str = "data/charts") -> str:
         """Save chart image to file.
