@@ -1,0 +1,19 @@
+# Data
+pandas>=2.0.0
+numpy>=1.24.0
+yfinance>=0.2.0
+
+# AI/ML
+scikit-learn>=1.3.0
+# torch>=2.0.0  # Uncomment if using PyTorch
+
+# Trading / Backtesting
+# backtrader>=1.9.78  # Uncomment if using Backtrader
+
+# Utilities
+python-dotenv>=1.0.0
+requests>=2.31.0
+
+# Development
+pytest>=7.4.0
+jupyter>=1.0.0

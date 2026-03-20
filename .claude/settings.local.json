@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ls -la \"/Users/k4195255/Library/CloudStorage/OneDrive-共有ライブラリ-\\(有\\)鈴真設計/Switch ROM 共有 - 課題/AiTradeTool\")",
+      "Bash(find '/Users/k4195255/Library/CloudStorage/OneDrive-共有ライブラリ-\\(有\\)鈴真設計/Switch ROM 共有 - 課題/AiTradeTool' -maxdepth 3)",
+      "Bash(BASE=\"/Users/k4195255/Library/CloudStorage/OneDrive-共有ライブラリ-\\(有\\)鈴真設計/Switch ROM 共有 - 課題/AiTradeTool\")",
+      "Bash(mkdir -p \"$BASE/src/data\" \"$BASE/src/models\" \"$BASE/src/strategies\" \"$BASE/src/brokers\" \"$BASE/src/utils\")",
+      "Bash(mkdir -p \"$BASE/tests\")",
+      "Bash(mkdir -p \"$BASE/notebooks\")",
+      "Bash(mkdir -p \"$BASE/data/raw\" \"$BASE/data/processed\")",
+      "Bash(find \"/Users/k4195255/Library/CloudStorage/OneDrive-共有ライブラリ-\\(有\\)鈴真設計/Switch ROM 共有 - 課題/AiTradeTool\" -not -path '*/.claude/*')",
+      "WebFetch(domain:www.youtube.com)"
+    ]
+  }
+}
