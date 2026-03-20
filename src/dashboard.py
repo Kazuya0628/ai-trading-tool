@@ -342,7 +342,7 @@ DASHBOARD_HTML = """
                             price: pos.entry, color: '#3b82f6',
                             lineWidth: 2, lineStyle: 0,
                             axisLabelVisible: true,
-                            title: 'Entry ' + pos.direction + ' ' + pos.entry.toFixed(dec),
+                            title: pos.direction + ' ' + pos.size.toFixed(2) + ' lots @ ' + pos.entry.toFixed(dec) + ' [' + pos.pattern + ']',
                         });
                         slLines[pair.instrument] = series.createPriceLine({
                             price: pos.sl, color: '#ef4444',
@@ -486,6 +486,8 @@ def api_data() -> Any:
                         "sl": p.get("sl", 0),
                         "tp": p.get("tp", 0),
                         "direction": p.get("direction", "BUY"),
+                        "size": p.get("size", 0),
+                        "pattern": p.get("pattern", ""),
                     }
 
             pairs_data.append({
