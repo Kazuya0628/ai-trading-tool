@@ -3,6 +3,8 @@
 Supports: Email (SMTP), Discord (Webhook), LINE Notify.
 """
 
+from __future__ import annotations
+
 import smtplib
 from datetime import datetime
 from email.mime.multipart import MIMEMultipart

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """AI FX Trading Tool - Main Entry Point.
 
-Data Source: OANDA v20 API
+Data Source: Twelve Data / OANDA v20 API
 Trading Mode: Paper trading (analysis & simulation only)
 
 Usage:
@@ -10,6 +10,8 @@ Usage:
     python main.py --status         # Check account status
     python main.py --analyze USD_JPY  # Analyze a specific pair
 """
+
+from __future__ import annotations
 
 import argparse
 import json
