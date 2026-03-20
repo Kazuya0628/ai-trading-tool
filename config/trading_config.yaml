@@ -1,0 +1,241 @@
+# ============================================
+# AI FX Trading Tool - Configuration
+# ============================================
+# Based on AI Sennin's methodology:
+# - Pattern recognition (Double Bottom, Double Top, Head & Shoulders)
+# - Multi-timeframe analysis
+# - AI visual chart analysis using Gemini
+# - Systematic backtesting with 3+ years data
+# - Risk management with strict stop-loss
+
+# ============================================
+# Trading Pairs (IG Securities EPICs)
+# ============================================
+trading:
+  pairs:
+    - epic: "CS.D.USDJPY.TODAY.IP"
+      name: "USD/JPY"
+      min_lot: 1.0
+      pip_value: 0.01
+    - epic: "CS.D.EURUSD.TODAY.IP"
+      name: "EUR/USD"
+      min_lot: 1.0
+      pip_value: 0.0001
+    - epic: "CS.D.GBPUSD.TODAY.IP"
+      name: "GBP/USD"
+      min_lot: 1.0
+      pip_value: 0.0001
+    - epic: "CS.D.EURJPY.TODAY.IP"
+      name: "EUR/JPY"
+      min_lot: 1.0
+      pip_value: 0.01
+    - epic: "CS.D.GBPJPY.TODAY.IP"
+      name: "GBP/JPY"
+      min_lot: 1.0
+      pip_value: 0.01
+    - epic: "CS.D.AUDUSD.TODAY.IP"
+      name: "AUD/USD"
+      min_lot: 1.0
+      pip_value: 0.0001
+
+  # Active pairs to trade (subset of above)
+  active_pairs:
+    - "CS.D.USDJPY.TODAY.IP"
+    - "CS.D.EURUSD.TODAY.IP"
+    - "CS.D.GBPJPY.TODAY.IP"
+
+# ============================================
+# Timeframe Configuration (Multi-Timeframe)
+# ============================================
+timeframes:
+  # Primary analysis timeframes
+  primary: "HOUR_4"      # 4-hour chart for pattern detection
+  secondary: "HOUR"       # 1-hour chart for entry timing
+  trend: "DAY"            # Daily chart for overall trend
+
+  # Available: SECOND, MINUTE, MINUTE_2, MINUTE_3, MINUTE_5,
+  # MINUTE_10, MINUTE_15, MINUTE_30, HOUR, HOUR_2, HOUR_3,
+  # HOUR_4, DAY, WEEK, MONTH
+
+# ============================================
+# AI Pattern Recognition Settings
+# ============================================
+pattern_recognition:
+  # Patterns to detect (AI Sennin's methodology)
+  enabled_patterns:
+    - "double_bottom"           # W-shape reversal
+    - "double_top"              # M-shape reversal
+    - "inverse_head_shoulders"  # Complex reversal
+    - "head_shoulders"          # Bearish reversal
+    - "channel_breakout"        # Breakout strategy
+    - "ma_crossover"            # Moving average crossover
+
+  # Double Bottom specific settings
+  double_bottom:
+    # "Right-side up" variant preferred (second trough higher)
+    prefer_higher_low: true
+    min_pattern_bars: 20
+    max_pattern_bars: 100
+    neckline_break_confirmation: true
+
+  # Inverse Head & Shoulders
+  inverse_head_shoulders:
+    prefer_right_shoulder_up: true
+    min_pattern_bars: 30
+    max_pattern_bars: 150
+
+  # Channel Breakout
+  channel_breakout:
+    lookback_period: 20
+    breakout_threshold_atr_multiple: 1.5
+
+  # Moving Average Crossover
+  ma_crossover:
+    fast_period: 20
+    slow_period: 50
+    signal_period: 9
+
+# ============================================
+# Technical Indicators
+# ============================================
+indicators:
+  # Moving Averages
+  sma_periods: [20, 50, 100, 200]
+  ema_periods: [9, 21, 55, 200]
+
+  # RSI
+  rsi_period: 14
+  rsi_overbought: 70
+  rsi_oversold: 30
+
+  # MACD
+  macd_fast: 12
+  macd_slow: 26
+  macd_signal: 9
+
+  # Bollinger Bands
+  bb_period: 20
+  bb_std: 2.0
+
+  # ATR (for stop-loss calculation)
+  atr_period: 14
+
+  # ADX (trend strength)
+  adx_period: 14
+  adx_trend_threshold: 25
+
+# ============================================
+# AI Visual Analysis (Gemini)
+# ============================================
+ai_analysis:
+  enabled: true
+  model: "gemini-2.5-flash"
+  # Chart image settings
+  chart_width: 1200
+  chart_height: 800
+  chart_style: "charles"
+
+  # Analysis prompt template
+  prompt_template: |
+    Analyze this FX chart image. Identify if any of the following patterns are present:
+    1. Double Bottom (W-shape) - especially "right-side up" variant with higher second low
+    2. Double Top (M-shape)
+    3. Inverse Head and Shoulders - especially "right shoulder up" variant
+    4. Head and Shoulders
+    5. Channel Breakout
+    6. Moving Average Crossover signals
+
+    For each detected pattern, respond with:
+    - Pattern name
+    - Confidence level (0-100)
+    - Signal direction: BUY or SELL
+    - Key price levels (support, resistance, neckline)
+
+    If no clear pattern is detected, respond with: NO_SIGNAL
+
+    Return ONLY a JSON object with the following structure:
+    {
+      "signal": 1 or 0,
+      "direction": "BUY" or "SELL" or "NONE",
+      "pattern": "pattern_name",
+      "confidence": 0-100,
+      "key_levels": {"support": price, "resistance": price, "neckline": price},
+      "reasoning": "brief explanation"
+    }
+
+# ============================================
+# Risk Management
+# ============================================
+risk_management:
+  # Position sizing
+  risk_per_trade_pct: 1.0          # Risk 1% of account per trade
+  max_position_size_lots: 10.0
+  max_open_positions: 3
+  max_positions_per_pair: 1
+
+  # Stop Loss
+  stop_loss_atr_multiple: 2.0      # SL = 2x ATR below entry
+  min_stop_loss_pips: 10
+  max_stop_loss_pips: 100
+
+  # Take Profit
+  take_profit_rr_ratio: 2.0        # TP = 2:1 reward:risk ratio
+  trailing_stop_enabled: true
+  trailing_stop_atr_multiple: 1.5
+
+  # Daily limits
+  max_daily_loss_pct: 2.0          # Stop trading if daily loss > 2%
+  max_daily_trades: 10
+  max_weekly_loss_pct: 5.0
+
+  # Drawdown control
+  max_drawdown_pct: 10.0           # Stop all trading if drawdown > 10%
+  drawdown_cooldown_hours: 24
+
+# ============================================
+# Backtesting Configuration
+# ============================================
+backtesting:
+  # Data period (AI Sennin recommends 3+ years)
+  lookback_years: 3
+  initial_capital: 1000000         # 100万円
+  commission_per_trade: 0.0        # IG spread is included
+  slippage_pips: 0.5
+
+  # Walk-forward optimization
+  in_sample_pct: 70
+  out_sample_pct: 30
+
+  # Performance targets (AI Sennin's metrics)
+  min_profit_factor: 1.2
+  min_win_rate: 0.35               # 35% win rate is acceptable with good R:R
+  target_win_rate: 0.60            # 60% target
+  min_sharpe_ratio: 1.0
+
+# ============================================
+# Execution Settings
+# ============================================
+execution:
+  # Order type
+  order_type: "MARKET"             # MARKET or LIMIT
+  limit_distance_pips: 2
+
+  # Timing
+  check_interval_seconds: 300      # Check every 5 minutes
+  trading_hours:
+    start: "00:00"                 # FX is 24h but can restrict
+    end: "23:59"
+  avoid_news_minutes: 30           # Avoid trading 30 min around news
+
+  # Session management
+  session_refresh_minutes: 55      # Refresh IG session before 60min timeout
+
+# ============================================
+# Logging
+# ============================================
+logging:
+  level: "INFO"
+  file: "logs/trading.log"
+  max_size_mb: 50
+  rotation: "1 week"
+  trade_log: "logs/trades.log"

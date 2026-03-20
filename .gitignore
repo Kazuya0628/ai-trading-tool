@@ -9,6 +9,10 @@ __pycache__/
 # Data (often large/sensitive)
 data/raw/
 data/processed/
+data/charts/
+
+# Logs
+logs/
 
 # Jupyter
 .ipynb_checkpoints/
@@ -21,3 +25,12 @@ data/processed/
 dist/
 build/
 *.egg-info/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test cache
+.pytest_cache/
+.coverage
+htmlcov/
