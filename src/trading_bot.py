@@ -173,6 +173,33 @@ class TradingBot:
 
             if opens:
                 self._open_trades = opens
+                # Also restore into broker's paper positions so broker
+                # knows about existing positions (prevents deal_id reuse, etc.)
+                for inst, trade in opens.items():
+                    if hasattr(self.broker, "_paper_positions"):
+                        self.broker._paper_positions[inst] = {
+                            "deal_id": trade.get("deal_id", ""),
+                            "direction": trade.get("direction", ""),
+                            "entry_price": trade.get("entry_price", 0),
+                            "size": trade.get("size", 0),
+                            "stop_loss": trade.get("stop_loss", 0),
+                            "take_profit": trade.get("take_profit", 0),
+                            "trailing_stop": False,
+                            "opened_at": "",
+                        }
+                # Restore deal_id counter to avoid reuse
+                if hasattr(self.broker, "_next_deal_id"):
+                    max_id = 0
+                    for trade in opens.values():
+                        deal = trade.get("deal_id", "")
+                        if deal.startswith("PAPER-"):
+                            try:
+                                num = int(deal.replace("PAPER-", ""))
+                                max_id = max(max_id, num)
+                            except ValueError:
+                                pass
+                    self.broker._next_deal_id = max_id + 1
+
                 logger.info(
                     f"Restored {len(opens)} open positions from log: "
                     f"{list(opens.keys())}"
