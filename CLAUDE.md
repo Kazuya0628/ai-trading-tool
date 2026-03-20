@@ -1,39 +1,71 @@
-# AiTradeTool - Claude Code 指示書
+# AI FX Trading Tool - IG Securities Automated Trading
 
 ## プロジェクト概要
-Pythonで構築するAI搭載のトレーディングツール。
+AI仙人のメソドロジーに基づくAI搭載FX自動売買ツール。
+IG証券 REST APIを使用して自動トレードを実行します。
 
-## フォルダ構成
+## アーキテクチャ
 
 ```
 AiTradeTool/
-├── CLAUDE.md              # このファイル（Claude Code への指示）
-├── .gitignore
-├── .env.example           # 環境変数のテンプレート（.env は絶対にコミットしない）
-├── requirements.txt       # Python依存ライブラリ
-├── src/                   # ソースコード
-│   ├── data/              # 市場データの取得・加工
-│   ├── models/            # AI/MLモデル（価格予測など）
-│   ├── strategies/        # トレード戦略の実装
-│   ├── brokers/           # ブローカーAPIとの連携
-│   └── utils/             # 共通ユーティリティ
-├── tests/                 # ユニット・統合テスト
-├── notebooks/             # 分析・検証用 Jupyter ノートブック
-├── docs/                  # 参考資料・仕様書
-│   ├── api/               # ブローカー・データプロバイダーのAPI仕様
-│   └── research/          # 参考論文・調査資料
-└── data/
-    ├── raw/               # 取得した生データ
-    └── processed/         # 加工済み・特徴量データ
+├── main.py                    # エントリーポイント（CLI）
+├── config/
+│   └── trading_config.yaml    # トレード設定ファイル
+├── src/
+│   ├── trading_bot.py         # メイン自動売買エンジン
+│   ├── brokers/
+│   │   └── ig_client.py       # IG証券 API クライアント
+│   ├── data/
+│   │   ├── market_data.py     # マーケットデータ取得・管理
+│   │   └── indicators.py      # テクニカル指標計算
+│   ├── models/
+│   │   ├── risk_manager.py    # リスク管理・ポジションサイジング
+│   │   └── backtest_engine.py # バックテストエンジン
+│   ├── strategies/
+│   │   ├── pattern_detector.py # チャートパターン検出
+│   │   ├── ai_analyzer.py      # Gemini AI チャート分析
+│   │   └── strategy_engine.py  # マルチ戦略エンジン
+│   └── utils/
+│       ├── config_loader.py   # 設定読み込み
+│       ├── logger.py          # ログ設定
+│       └── notifier.py        # Discord/LINE通知
+├── tests/                     # テストスイート（46テスト）
+├── data/                      # マーケットデータ保存
+└── logs/                      # トレードログ
 ```
 
-## 開発環境のセットアップ
+## AI仙人のメソドロジー実装
+
+### パターン認識
+- **ダブルボトム（W型）**: 右肩上がりバリアント優先
+- **ダブルトップ（M型）**: ベアリッシュリバーサル
+- **逆ヘッドアンドショルダーズ**: 右肩上がりバリアント優先
+- **ヘッドアンドショルダーズ**: ベアリッシュリバーサル
+- **チャネルブレイクアウト**: 基本戦略
+- **移動平均クロスオーバー**: ゴールデンクロス/デスクロス
+
+### マルチタイムフレーム分析
+- 日足: トレンド方向判定
+- 4時間足: パターン検出（メイン）
+- 1時間足: エントリータイミング
+
+### AI ビジュアル分析（Gemini）
+1. チャート画像生成
+2. Gemini AIによるパターン認識
+3. バイナリシグナル（1=トレード, 0=ノーシグナル）
+4. 実行判定
+
+### リスク管理
+- 1トレードあたりリスク: 口座の1%
+- ATRベースのストップロス
+- 2:1のリスクリワード比
+- 最大ドローダウン: 10%で全停止
+- デイリー損失上限: 2%
+- トレーリングストップ対応
+
+## セットアップ
 
 ```bash
-# 仮想環境の作成と有効化
-python -m venv venv
-source venv/bin/activate  # Windows: venv\Scripts\activate
-
 # 依存ライブラリのインストール
 pip install -r requirements.txt
 
@@ -42,19 +74,46 @@ cp .env.example .env
 # .env を編集して APIキーを設定
 ```
 
-## よく使うコマンド
+### 必要なAPIキー
+1. **IG証券 API**: https://labs.ig.com/ でAPIキーを取得
+2. **Google Gemini API** (オプション): AI ビジュアル分析用
+
+## 使い方
 
 ```bash
-# テストの実行
-pytest tests/
+# ペーパートレードモード（デフォルト）
+python main.py
 
-# Jupyter ノートブックの起動
-jupyter notebook notebooks/
+# ライブトレード（注意: 実際の資金を使用）
+python main.py --live
+
+# バックテスト実行
+python main.py --backtest
+python main.py --backtest --epic CS.D.USDJPY.TODAY.IP
+
+# 特定ペアの分析
+python main.py --analyze CS.D.USDJPY.TODAY.IP
+
+# アカウントステータス確認
+python main.py --status
+```
+
+## コマンド
+
+```bash
+# テスト実行
+pytest tests/ -v
+
+# 特定テストの実行
+pytest tests/test_patterns.py -v
+pytest tests/test_risk_manager.py -v
+pytest tests/test_indicators.py -v
+pytest tests/test_backtest.py -v
 ```
 
 ## コーディング規約
-- PEP 8 に従う
-- 全ての関数に型ヒントを付ける
-- パブリックなクラス・関数にはdocstringを書く
-- トレード戦略のロジックはテストを必ず書く
-- シークレット情報は `.env` に記載し、コードに直書きしない
+- PEP 8 準拠
+- 全関数に型ヒント
+- パブリックなクラス・関数にdocstring
+- トレード戦略のロジックは必ずテストを書く
+- シークレット情報は `.env` に記載（コードに直書き禁止）
