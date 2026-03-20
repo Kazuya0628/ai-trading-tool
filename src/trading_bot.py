@@ -102,6 +102,10 @@ class TradingBot:
         self.notifier = Notifier(
             discord_webhook=self.config.env.get("DISCORD_WEBHOOK_URL", ""),
             line_token=self.config.env.get("LINE_NOTIFY_TOKEN", ""),
+            line_config={
+                "channel_access_token": self.config.env.get("LINE_CHANNEL_ACCESS_TOKEN", ""),
+                "user_id": self.config.env.get("LINE_USER_ID", ""),
+            },
             email_config={
                 "smtp_host": self.config.env.get("SMTP_HOST", ""),
                 "smtp_port": self.config.env.get("SMTP_PORT", "587"),
@@ -527,6 +531,7 @@ class TradingBot:
                     )
 
                     if new_sl != trade_info["stop_loss"]:
+                        old_sl = trade_info["stop_loss"]
                         self.broker.update_position(
                             deal_id=trade_info["deal_id"],
                             stop_level=new_sl,
@@ -535,6 +540,14 @@ class TradingBot:
                         logger.info(
                             f"Trailing stop updated: {instrument} "
                             f"new SL={new_sl:.5f}"
+                        )
+                        pair_name = instrument.replace("_", "/")
+                        self.notifier.sl_updated(
+                            pair=pair_name,
+                            direction=trade_info["direction"],
+                            old_sl=old_sl,
+                            new_sl=new_sl,
+                            entry=trade_info["entry_price"],
                         )
 
             except Exception as e:

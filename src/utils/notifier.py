@@ -1,6 +1,6 @@
 """Notification system for trade alerts.
 
-Supports: Email (SMTP), Discord (Webhook), LINE Notify.
+Supports: Email (SMTP), Discord (Webhook), LINE Messaging API.
 """
 
 from __future__ import annotations
@@ -22,10 +22,21 @@ class Notifier:
         self,
         discord_webhook: str = "",
         line_token: str = "",
+        line_config: dict[str, str] | None = None,
         email_config: dict[str, Any] | None = None,
     ) -> None:
         self.discord_webhook = discord_webhook
+        # Legacy LINE Notify (deprecated)
         self.line_token = line_token
+
+        # LINE Messaging API
+        self.line_config = line_config or {}
+        self.line_channel_token = self.line_config.get("channel_access_token", "")
+        self.line_user_id = self.line_config.get("user_id", "")
+        self.line_enabled = bool(self.line_channel_token and self.line_user_id)
+
+        if self.line_enabled:
+            logger.info(f"LINE Messaging API enabled: -> {self.line_user_id[:8]}...")
 
         # Email configuration
         self.email_config = email_config or {}
@@ -52,8 +63,10 @@ class Notifier:
             self._send_email(title, message, fields)
         if self.discord_webhook:
             self._send_discord(title, message, fields)
-        if self.line_token:
-            self._send_line(title, message)
+        if self.line_enabled:
+            self._send_line_messaging(title, message, fields)
+        elif self.line_token:
+            self._send_line_notify(title, message)
 
     def _send_email(
         self, title: str, message: str, fields: dict[str, Any] | None = None
@@ -149,8 +162,36 @@ class Notifier:
         except Exception as e:
             logger.error(f"Discord notification failed: {e}")
 
-    def _send_line(self, title: str, message: str) -> None:
-        """Send LINE Notify notification."""
+    def _send_line_messaging(
+        self, title: str, message: str, fields: dict[str, Any] | None = None
+    ) -> None:
+        """Send notification via LINE Messaging API (Push Message)."""
+        # Build message text
+        text = f"[AI FX Bot] {title}\n{message}"
+        if fields:
+            text += "\n" + "\n".join(f"  {k}: {v}" for k, v in fields.items())
+
+        payload = {
+            "to": self.line_user_id,
+            "messages": [{"type": "text", "text": text}],
+        }
+        try:
+            resp = requests.post(
+                "https://api.line.me/v2/bot/message/push",
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {self.line_channel_token}",
+                },
+                json=payload,
+                timeout=10,
+            )
+            resp.raise_for_status()
+            logger.info(f"LINE message sent: {title}")
+        except Exception as e:
+            logger.error(f"LINE Messaging API failed: {e}")
+
+    def _send_line_notify(self, title: str, message: str) -> None:
+        """Send LINE Notify notification (deprecated, legacy support)."""
         try:
             resp = requests.post(
                 "https://notify-api.line.me/api/notify",
@@ -160,7 +201,7 @@ class Notifier:
             )
             resp.raise_for_status()
         except Exception as e:
-            logger.error(f"LINE notification failed: {e}")
+            logger.error(f"LINE Notify failed: {e}")
 
     def trade_opened(self, pair: str, direction: str, size: float, price: float,
                      sl: float, tp: float, pattern: str) -> None:
@@ -184,6 +225,34 @@ class Notifier:
         self.send(
             title=f"CLOSED {direction} {pair} ({result})",
             message=f"P&L: {pnl:+,.0f} ({pips:+.1f} pips)",
+        )
+
+    def sl_updated(self, pair: str, direction: str, old_sl: float, new_sl: float,
+                   entry: float) -> None:
+        """Notify about a trailing stop update."""
+        decimals = 3 if "JPY" in pair else 5
+        self.send(
+            title=f"SL Updated: {pair}",
+            message=f"{direction} position trailing stop moved",
+            fields={
+                "Entry": f"{entry:.{decimals}f}",
+                "Old SL": f"{old_sl:.{decimals}f}",
+                "New SL": f"{new_sl:.{decimals}f}",
+            },
+        )
+
+    def tp_updated(self, pair: str, direction: str, old_tp: float, new_tp: float,
+                   entry: float) -> None:
+        """Notify about a take profit update."""
+        decimals = 3 if "JPY" in pair else 5
+        self.send(
+            title=f"TP Updated: {pair}",
+            message=f"{direction} position take profit changed",
+            fields={
+                "Entry": f"{entry:.{decimals}f}",
+                "Old TP": f"{old_tp:.{decimals}f}",
+                "New TP": f"{new_tp:.{decimals}f}",
+            },
         )
 
     def alert(self, message: str) -> None:
