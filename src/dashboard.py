@@ -273,6 +273,12 @@ DASHBOARD_HTML = """
                 const resp = await fetch('/api/data');
                 const data = await resp.json();
 
+                if (data.error) {
+                    document.getElementById('loading').textContent = 'API Error: ' + data.error;
+                    document.getElementById('loading').style.color = '#ef4444';
+                    return;
+                }
+
                 // Update info cards
                 document.getElementById('update-time').textContent = data.timestamp;
                 document.getElementById('balance').textContent = data.balance;
@@ -327,20 +333,24 @@ DASHBOARD_HTML = """
                             series.removePriceLine(tpLines[pair.instrument]);
                         }
 
+                        const dec = pair.instrument.includes('JPY') ? 3 : 5;
                         entryLines[pair.instrument] = series.createPriceLine({
                             price: pos.entry, color: '#3b82f6',
-                            lineWidth: 1, lineStyle: 0,
-                            axisLabelVisible: true, title: 'Entry',
+                            lineWidth: 2, lineStyle: 0,
+                            axisLabelVisible: true,
+                            title: 'Entry ' + pos.direction + ' ' + pos.entry.toFixed(dec),
                         });
                         slLines[pair.instrument] = series.createPriceLine({
                             price: pos.sl, color: '#ef4444',
-                            lineWidth: 1, lineStyle: 2,
-                            axisLabelVisible: true, title: 'SL',
+                            lineWidth: 2, lineStyle: 2,
+                            axisLabelVisible: true,
+                            title: 'SL ' + pos.sl.toFixed(dec),
                         });
                         tpLines[pair.instrument] = series.createPriceLine({
                             price: pos.tp, color: '#22c55e',
-                            lineWidth: 1, lineStyle: 2,
-                            axisLabelVisible: true, title: 'TP',
+                            lineWidth: 2, lineStyle: 2,
+                            axisLabelVisible: true,
+                            title: 'TP ' + pos.tp.toFixed(dec),
                         });
                     }
                 }
@@ -531,28 +541,38 @@ def api_data() -> Any:
 
 
 def _get_positions() -> list[dict]:
-    """Read open positions from trade log."""
+    """Read open positions from trade log.
+
+    Log format: '2026-03-20 08:39:19.288 | OPEN|USD/JPY|SELL|deal=...|entry=...|sl=...|tp=...|size=...|pattern=...'
+    """
     trade_log = Path("logs/trades.log")
     if not trade_log.exists():
+        logger.warning("No trade log found at logs/trades.log")
         return []
 
     positions: dict[str, dict] = {}
+    closed: set[str] = set()
     try:
         with open(trade_log) as f:
             for line in f:
-                if "OPEN|" in line:
-                    parts = line.strip().split("|")
-                    if len(parts) >= 8:
+                # Split on ' | ' first to separate timestamp from trade data
+                if " | " not in line:
+                    continue
+                _, _, trade_part = line.partition(" | ")
+                trade_part = trade_part.strip()
+
+                if trade_part.startswith("OPEN|"):
+                    parts = trade_part.split("|")
+                    # parts[0]='OPEN', parts[1]='USD/JPY', parts[2]='SELL', parts[3+]=key=value
+                    if len(parts) >= 7:
                         pair_name = parts[1]
                         direction = parts[2]
-                        # Parse key=value fields
                         fields = {}
                         for p in parts[3:]:
                             if "=" in p:
                                 k, v = p.split("=", 1)
                                 fields[k] = v
 
-                        # Find instrument from pair name
                         instrument = pair_name.replace("/", "_")
                         positions[instrument] = {
                             "instrument": instrument,
@@ -563,9 +583,21 @@ def _get_positions() -> list[dict]:
                             "size": float(fields.get("size", 0)),
                             "pattern": fields.get("pattern", ""),
                         }
+
+                elif trade_part.startswith("CLOSE|"):
+                    parts = trade_part.split("|")
+                    if len(parts) >= 2:
+                        instrument = parts[1].replace("/", "_")
+                        closed.add(instrument)
+
+        # Remove closed positions
+        for inst in closed:
+            positions.pop(inst, None)
+
     except Exception as e:
         logger.error(f"Error reading trade log: {e}")
 
+    logger.info(f"Positions from log: {list(positions.keys())}")
     return list(positions.values())
 
 
