@@ -105,6 +105,7 @@ class TradingBot:
             line_config={
                 "channel_access_token": self.config.env.get("LINE_CHANNEL_ACCESS_TOKEN", ""),
                 "user_id": self.config.env.get("LINE_USER_ID", ""),
+                "imgbb_api_key": self.config.env.get("IMGBB_API_KEY", ""),
             },
             email_config={
                 "smtp_host": self.config.env.get("SMTP_HOST", ""),
@@ -384,8 +385,20 @@ class TradingBot:
             f"Regime={self.risk_manager.adaptive.market_regime.regime}"
         )
 
-        # 6. Execute trade (always paper mode)
-        self._execute_trade(instrument, pair_name, best_signal, pos_size)
+        # 6. Generate chart image for notification
+        chart_image = None
+        gemini_reasoning = best_signal.reasoning or ""
+        if self.ai_analyzer and "primary" in mtf_data:
+            chart_image = self.ai_analyzer.generate_chart_image(
+                mtf_data["primary"], pair_name,
+                self.config.timeframes.get("primary", "HOUR_4"),
+            )
+
+        # 7. Execute trade (always paper mode)
+        self._execute_trade(
+            instrument, pair_name, best_signal, pos_size,
+            chart_image=chart_image, gemini_reasoning=gemini_reasoning,
+        )
 
     def _execute_trade(
         self,
@@ -393,6 +406,8 @@ class TradingBot:
         pair_name: str,
         signal: TradeSignal,
         pos_size: Any,
+        chart_image: bytes | None = None,
+        gemini_reasoning: str = "",
     ) -> None:
         """Execute a paper trade.
 
@@ -401,6 +416,8 @@ class TradingBot:
             pair_name: Currency pair name.
             signal: Trade signal.
             pos_size: Position size calculation.
+            chart_image: Chart PNG bytes for LINE notification.
+            gemini_reasoning: Gemini AI analysis text.
         """
         result = self.broker.open_position(
             epic=instrument,
@@ -436,14 +453,21 @@ class TradingBot:
                 f"pattern={signal.pattern.value}"
             )
 
-            self.notifier.trade_opened(
-                pair=pair_name,
-                direction=signal.direction.value,
-                size=pos_size.lots,
-                price=signal.entry_price,
-                sl=signal.stop_loss,
-                tp=signal.take_profit,
-                pattern=signal.pattern.value,
+            # Send notification with chart image + Gemini analysis
+            rr = abs(signal.take_profit - signal.entry_price) / abs(signal.entry_price - signal.stop_loss) if abs(signal.entry_price - signal.stop_loss) > 0 else 0
+            self.notifier.send_with_chart(
+                title=f"{signal.direction.value} {pair_name}",
+                message=f"Pattern: {signal.pattern.value}",
+                fields={
+                    "Entry Price": f"{signal.entry_price:.5f}",
+                    "Size": f"{pos_size.lots:.2f} lots",
+                    "Stop Loss": f"{signal.stop_loss:.5f}",
+                    "Take Profit": f"{signal.take_profit:.5f}",
+                    "R:R": f"1:{rr:.1f}",
+                    "Sources": ", ".join(signal.sources),
+                },
+                chart_image=chart_image,
+                gemini_response=gemini_reasoning,
             )
         else:
             logger.error(

@@ -5,6 +5,7 @@ Supports: Email (SMTP), Discord (Webhook), LINE Messaging API.
 
 from __future__ import annotations
 
+import base64
 import smtplib
 from datetime import datetime
 from email.mime.multipart import MIMEMultipart
@@ -34,6 +35,9 @@ class Notifier:
         self.line_channel_token = self.line_config.get("channel_access_token", "")
         self.line_user_id = self.line_config.get("user_id", "")
         self.line_enabled = bool(self.line_channel_token and self.line_user_id)
+
+        # imgbb for image hosting (needed for LINE image messages)
+        self.imgbb_api_key = self.line_config.get("imgbb_api_key", "")
 
         if self.line_enabled:
             logger.info(f"LINE Messaging API enabled: -> {self.line_user_id[:8]}...")
@@ -189,6 +193,130 @@ class Notifier:
             logger.info(f"LINE message sent: {title}")
         except Exception as e:
             logger.error(f"LINE Messaging API failed: {e}")
+
+    def _upload_image_imgbb(self, image_bytes: bytes) -> str | None:
+        """Upload image to imgbb and return the public URL.
+
+        Args:
+            image_bytes: PNG image bytes.
+
+        Returns:
+            Public HTTPS URL or None on failure.
+        """
+        if not self.imgbb_api_key:
+            return None
+
+        try:
+            b64 = base64.b64encode(image_bytes).decode("utf-8")
+            resp = requests.post(
+                "https://api.imgbb.com/1/upload",
+                data={
+                    "key": self.imgbb_api_key,
+                    "image": b64,
+                    "expiration": 86400,  # 24 hours
+                },
+                timeout=15,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            url = data.get("data", {}).get("url", "")
+            if url:
+                logger.info(f"Image uploaded to imgbb: {url[:60]}...")
+            return url or None
+        except Exception as e:
+            logger.error(f"imgbb upload failed: {e}")
+            return None
+
+    def send_with_chart(
+        self,
+        title: str,
+        message: str,
+        fields: dict[str, Any] | None = None,
+        chart_image: bytes | None = None,
+        gemini_response: str = "",
+    ) -> None:
+        """Send notification with chart image and Gemini analysis.
+
+        Used for trade entry signals where AI analysis is available.
+        Sends image + text as a pair to LINE (counts as 1 message).
+
+        Args:
+            title: Notification title.
+            message: Notification body.
+            fields: Additional key-value data.
+            chart_image: PNG chart image bytes.
+            gemini_response: Raw Gemini analysis text.
+        """
+        # Email always gets text (image as attachment is complex, skip for now)
+        if self.email_enabled:
+            full_msg = message
+            if gemini_response:
+                full_msg += f"\n\nGemini Analysis:\n{gemini_response[:500]}"
+            self._send_email(title, full_msg, fields)
+
+        if self.discord_webhook:
+            self._send_discord(title, message, fields)
+
+        # LINE: send image + analysis text as a single push (counts as 1 message)
+        if self.line_enabled:
+            self._send_line_with_chart(title, message, fields, chart_image, gemini_response)
+        elif self.line_token:
+            self._send_line_notify(title, message)
+
+    def _send_line_with_chart(
+        self,
+        title: str,
+        message: str,
+        fields: dict[str, Any] | None = None,
+        chart_image: bytes | None = None,
+        gemini_response: str = "",
+    ) -> None:
+        """Send LINE message with chart image and analysis text.
+
+        Uses a single push with multiple messages (image + text).
+        LINE counts this as 1 message toward the monthly quota.
+        """
+        messages = []
+
+        # Upload and add image if available
+        if chart_image and self.imgbb_api_key:
+            image_url = self._upload_image_imgbb(chart_image)
+            if image_url:
+                messages.append({
+                    "type": "image",
+                    "originalContentUrl": image_url,
+                    "previewImageUrl": image_url,
+                })
+
+        # Build analysis text
+        text = f"[AI FX Bot] {title}\n{message}"
+        if fields:
+            text += "\n" + "\n".join(f"  {k}: {v}" for k, v in fields.items())
+        if gemini_response:
+            # Truncate to fit LINE's 5000 char limit
+            analysis = gemini_response[:800]
+            text += f"\n\n[Gemini AI]\n{analysis}"
+
+        messages.append({"type": "text", "text": text[:5000]})
+
+        payload = {
+            "to": self.line_user_id,
+            "messages": messages,
+        }
+        try:
+            resp = requests.post(
+                "https://api.line.me/v2/bot/message/push",
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {self.line_channel_token}",
+                },
+                json=payload,
+                timeout=15,
+            )
+            resp.raise_for_status()
+            logger.info(f"LINE message+chart sent: {title}")
+        except Exception as e:
+            logger.error(f"LINE Messaging API (chart) failed: {e}")
 
     def _send_line_notify(self, title: str, message: str) -> None:
         """Send LINE Notify notification (deprecated, legacy support)."""
