@@ -18,6 +18,7 @@ from __future__ import annotations
 import time
 import traceback
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 import pandas as pd
@@ -120,6 +121,64 @@ class TradingBot:
         # State tracking
         self._running = False
         self._open_trades: dict[str, dict[str, Any]] = {}
+        self._restore_open_trades()
+
+    def _restore_open_trades(self) -> None:
+        """Restore open positions from trade log on startup."""
+        trade_log = Path("logs/trades.log")
+        if not trade_log.exists():
+            return
+
+        opens: dict[str, dict[str, Any]] = {}
+        closed: set[str] = set()
+        try:
+            with open(trade_log) as f:
+                for line in f:
+                    if " | " not in line:
+                        continue
+                    _, _, trade_part = line.partition(" | ")
+                    trade_part = trade_part.strip()
+
+                    if trade_part.startswith("OPEN|"):
+                        parts = trade_part.split("|")
+                        if len(parts) >= 7:
+                            pair_name = parts[1]
+                            direction = parts[2]
+                            fields = {}
+                            for p in parts[3:]:
+                                if "=" in p:
+                                    k, v = p.split("=", 1)
+                                    fields[k] = v
+                            instrument = pair_name.replace("/", "_")
+                            opens[instrument] = {
+                                "deal_id": fields.get("deal", ""),
+                                "direction": direction,
+                                "entry_price": float(fields.get("entry", 0)),
+                                "stop_loss": float(fields.get("sl", 0)),
+                                "take_profit": float(fields.get("tp", 0)),
+                                "size": float(fields.get("size", 0)),
+                                "pattern": fields.get("pattern", ""),
+                                "instrument": instrument,
+                            }
+
+                    elif trade_part.startswith("CLOSE|"):
+                        parts = trade_part.split("|")
+                        if len(parts) >= 2:
+                            instrument = parts[1].replace("/", "_")
+                            closed.add(instrument)
+
+            # Remove closed positions
+            for inst in closed:
+                opens.pop(inst, None)
+
+            if opens:
+                self._open_trades = opens
+                logger.info(
+                    f"Restored {len(opens)} open positions from log: "
+                    f"{list(opens.keys())}"
+                )
+        except Exception as e:
+            logger.error(f"Failed to restore positions from log: {e}")
 
     # --------------------------------------------------
     # Main Trading Loop
