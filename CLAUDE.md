@@ -37,6 +37,7 @@ AiTradeTool/
 │   │   ├── pattern_detector.py  # チャートパターン検出（6パターン）
 │   │   ├── ai_analyzer.py       # Gemini AI チャート分析
 │   │   └── strategy_engine.py   # マルチ戦略エンジン
+│   ├── dashboard.py             # リアルタイムWebダッシュボード（Flask + Lightweight Charts）
 │   └── utils/
 │       ├── config_loader.py     # 設定読み込み・ブローカーファクトリ
 │       ├── logger.py            # ログ設定
@@ -196,6 +197,10 @@ python main.py --analyze USD_JPY
 
 # アカウントステータス確認
 python main.py --status
+
+# リアルタイムWebダッシュボード（http://localhost:5000）
+python src/dashboard.py
+python src/dashboard.py --port 8080
 ```
 
 ### アクティブ通貨ペア
