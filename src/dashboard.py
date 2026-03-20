@@ -313,7 +313,11 @@ DASHBOARD_HTML = """
                     }
 
                     if (pair.candles && pair.candles.length > 0) {
-                        candleSeries[pair.instrument].setData(pair.candles);
+                        try {
+                            candleSeries[pair.instrument].setData(pair.candles);
+                        } catch (chartErr) {
+                            console.error('Chart error for ' + pair.instrument + ':', chartErr, 'First candle:', pair.candles[0]);
+                        }
                         const last = pair.candles[pair.candles.length - 1];
                         const priceEl = document.getElementById('price-' + pair.instrument);
                         priceEl.textContent = last.close.toFixed(pair.instrument.includes('JPY') ? 3 : 5);
@@ -452,16 +456,24 @@ def api_data() -> Any:
             df = broker.get_historical_prices(instrument, "HOUR", num_points=100)
             candles = []
             if not df.empty:
+                seen_times: set[int] = set()
                 for idx, row in df.iterrows():
                     ts = int(idx.timestamp())
+                    # Avoid duplicate timestamps (Lightweight Charts requires unique ascending times)
+                    if ts in seen_times:
+                        continue
+                    seen_times.add(ts)
                     candles.append({
                         "time": ts,
-                        "open": float(row["open"]),
-                        "high": float(row["high"]),
-                        "low": float(row["low"]),
-                        "close": float(row["close"]),
+                        "open": round(float(row["open"]), 5),
+                        "high": round(float(row["high"]), 5),
+                        "low": round(float(row["low"]), 5),
+                        "close": round(float(row["close"]), 5),
                     })
-                logger.info(f"Dashboard: {instrument} -> {len(candles)} candles")
+                # Ensure ascending order
+                candles.sort(key=lambda c: c["time"])
+                logger.info(f"Dashboard: {instrument} -> {len(candles)} candles, "
+                            f"range: {candles[0]['time']} ~ {candles[-1]['time']}")
             else:
                 logger.warning(f"Dashboard: {instrument} -> no data")
 
@@ -538,6 +550,26 @@ def api_data() -> Any:
         logger.error(f"Dashboard API error: {e}")
         logger.error(traceback.format_exc())
         return jsonify({"error": str(e), "traceback": traceback.format_exc()}), 500
+
+
+@app.route("/api/debug")
+def api_debug() -> Any:
+    """Debug endpoint to check raw data."""
+    if not broker or not config:
+        return jsonify({"error": "Not initialized"})
+
+    instrument = "USD_JPY"
+    df = broker.get_historical_prices(instrument, "HOUR", num_points=5)
+    raw = []
+    if not df.empty:
+        for idx, row in df.iterrows():
+            raw.append({
+                "datetime": str(idx),
+                "timestamp": int(idx.timestamp()),
+                "open": float(row["open"]),
+                "close": float(row["close"]),
+            })
+    return jsonify({"instrument": instrument, "count": len(raw), "data": raw})
 
 
 def _get_positions() -> list[dict]:
