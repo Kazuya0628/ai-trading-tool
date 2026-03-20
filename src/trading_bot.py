@@ -180,6 +180,31 @@ class TradingBot:
         except Exception as e:
             logger.error(f"Failed to restore positions from log: {e}")
 
+    def _has_open_position_in_log(self, instrument: str) -> bool:
+        """Check if a position is open for the given instrument in trade log."""
+        trade_log = Path("logs/trades.log")
+        if not trade_log.exists():
+            return False
+
+        pair_name = instrument.replace("_", "/")
+        open_count = 0
+        close_count = 0
+        try:
+            with open(trade_log) as f:
+                for line in f:
+                    if " | " not in line:
+                        continue
+                    _, _, trade_part = line.partition(" | ")
+                    trade_part = trade_part.strip()
+                    if trade_part.startswith(f"OPEN|{pair_name}|"):
+                        open_count += 1
+                    elif trade_part.startswith(f"CLOSE|{pair_name}|"):
+                        close_count += 1
+        except Exception:
+            return False
+
+        return open_count > close_count
+
     # --------------------------------------------------
     # Main Trading Loop
     # --------------------------------------------------
@@ -342,10 +367,32 @@ class TradingBot:
 
         logger.info(f"Analyzing {pair_name} ({instrument})...")
 
-        # Check if already have position in this pair
+        # Check if already have position in this pair (triple check)
+        # 1. In-memory check
         if instrument in self._open_trades:
-            logger.debug(f"Already have position in {pair_name}, skipping")
+            logger.debug(f"Already have position in {pair_name} (memory), skipping")
             return
+
+        # 2. Trade log check (survives restarts)
+        if self._has_open_position_in_log(instrument):
+            logger.warning(
+                f"Position found in trade log for {pair_name} but not in memory. "
+                f"Restoring and skipping."
+            )
+            self._restore_open_trades()
+            return
+
+        # 3. Broker check (ground truth)
+        try:
+            broker_positions = self.broker.get_open_positions()
+            if not broker_positions.empty and instrument in broker_positions.index:
+                logger.warning(
+                    f"Position found in broker for {pair_name} but not in memory. "
+                    f"Skipping."
+                )
+                return
+        except Exception:
+            pass  # If broker check fails, rely on log check
 
         # 1. Fetch multi-timeframe data
         timeframe_config = self.config.timeframes
@@ -453,7 +500,12 @@ class TradingBot:
                 self.config.timeframes.get("primary", "HOUR_4"),
             )
 
-        # 7. Execute trade (always paper mode)
+        # 7. Final duplicate check before execution
+        if instrument in self._open_trades or self._has_open_position_in_log(instrument):
+            logger.warning(f"BLOCKED duplicate trade for {pair_name} at final check")
+            return
+
+        # 8. Execute trade (always paper mode)
         self._execute_trade(
             instrument, pair_name, best_signal, pos_size,
             chart_image=chart_image, gemini_reasoning=gemini_reasoning,
