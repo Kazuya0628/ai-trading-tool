@@ -462,11 +462,37 @@ class TradingBot:
                     pattern=trade_info.get("pattern", ""),
                     instrument=instrument,
                 )
+
+                # Get exit price for logging
+                try:
+                    price_info = self.data_manager.get_latest_price(instrument)
+                    exit_price = price_info.get("mid", 0)
+                except Exception:
+                    exit_price = 0
+
+                pair_name = instrument.replace("_", "/")
+                log_trade(
+                    f"CLOSE|{pair_name}|"
+                    f"deal={trade_info.get('deal_id', '')}|"
+                    f"exit={exit_price:.5f}|"
+                    f"pnl={pnl:.2f}|"
+                    f"pattern={trade_info.get('pattern', '')}"
+                )
+
                 logger.info(
                     f"Position closed: {instrument} "
                     f"deal={trade_info.get('deal_id', 'N/A')} "
                     f"PnL=¥{pnl:+,.0f}"
                 )
+
+                # Notify
+                self.notifier.trade_closed(
+                    pair=pair_name,
+                    direction=trade_info.get("direction", ""),
+                    pnl=pnl,
+                    pips=0,
+                )
+
                 del self._open_trades[instrument]
             return
 

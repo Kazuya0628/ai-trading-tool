@@ -575,6 +575,18 @@ def api_data() -> Any:
         return jsonify({"error": str(e), "traceback": traceback.format_exc()}), 500
 
 
+@app.route("/api/divergence")
+def api_divergence() -> Any:
+    """Divergence check endpoint: forward vs backtest comparison."""
+    try:
+        from src.divergence_checker import run_check
+        result = run_check()
+        return jsonify(result)
+    except Exception as e:
+        logger.error(f"Divergence check error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/debug")
 def api_debug() -> Any:
     """Debug endpoint to check raw data."""
