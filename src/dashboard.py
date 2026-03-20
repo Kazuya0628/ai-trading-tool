@@ -187,6 +187,10 @@ DASHBOARD_HTML = """
             <div class="value" id="balance">--</div>
         </div>
         <div class="info-card">
+            <h3>Unrealized P&L</h3>
+            <div class="value" id="unrealized-pnl">--</div>
+        </div>
+        <div class="info-card">
             <h3>Daily P&L</h3>
             <div class="value" id="daily-pnl">--</div>
         </div>
@@ -215,7 +219,7 @@ DASHBOARD_HTML = """
             <thead>
                 <tr>
                     <th>Pair</th><th>Direction</th><th>Lots</th><th>Entry</th>
-                    <th>Current</th><th>SL</th><th>TP</th><th>P&L</th><th>Pattern</th>
+                    <th>Current</th><th>SL</th><th>TP</th><th>P&L (pips)</th><th>P&L (¥)</th><th>Pattern</th>
                 </tr>
             </thead>
             <tbody id="positions-body"></tbody>
@@ -282,6 +286,9 @@ DASHBOARD_HTML = """
                 // Update info cards
                 document.getElementById('update-time').textContent = data.timestamp;
                 document.getElementById('balance').textContent = data.balance;
+                document.getElementById('unrealized-pnl').textContent = data.unrealized_pnl;
+                document.getElementById('unrealized-pnl').style.color =
+                    data.unrealized_pnl_raw >= 0 ? '#22c55e' : '#ef4444';
                 document.getElementById('daily-pnl').textContent = data.daily_pnl;
                 document.getElementById('daily-pnl').style.color =
                     data.daily_pnl_raw >= 0 ? '#22c55e' : '#ef4444';
@@ -362,7 +369,7 @@ DASHBOARD_HTML = """
                 // Update positions table
                 const tbody = document.getElementById('positions-body');
                 if (data.positions.length === 0) {
-                    tbody.innerHTML = '<tr><td colspan="9" style="text-align:center;color:#555;">No open positions</td></tr>';
+                    tbody.innerHTML = '<tr><td colspan="10" style="text-align:center;color:#555;">No open positions</td></tr>';
                 } else {
                     tbody.innerHTML = data.positions.map(p => `
                         <tr>
@@ -373,7 +380,8 @@ DASHBOARD_HTML = """
                             <td>${p.current}</td>
                             <td style="color:#ef4444">${p.sl}</td>
                             <td style="color:#22c55e">${p.tp}</td>
-                            <td style="color:${p.pnl_raw >= 0 ? '#22c55e' : '#ef4444'}">${p.pnl}</td>
+                            <td style="color:${p.pnl_pips >= 0 ? '#22c55e' : '#ef4444'};font-weight:600">${p.pnl_pips >= 0 ? '+' : ''}${p.pnl_pips.toFixed(1)} pips</td>
+                            <td style="color:${p.pnl_raw >= 0 ? '#22c55e' : '#ef4444'};font-weight:600">${p.pnl}</td>
                             <td>${p.pattern}</td>
                         </tr>
                     `).join('');
@@ -500,6 +508,7 @@ def api_data() -> Any:
 
         # Build positions list for table
         positions_table = []
+        total_unrealized = 0.0
         for p in positions:
             instrument = p.get("instrument", "")
             pair_config = config.pair_configs.get(instrument, {})
@@ -511,10 +520,17 @@ def api_data() -> Any:
             entry = p.get("entry", 0)
             direction = p.get("direction", "BUY")
             size = p.get("size", 0)
-            pnl_pips = (current_price - entry) if direction == "BUY" else (entry - current_price)
-            pip_value = pair_config.get("pip_value", 0.01)
-            pnl_amount = pnl_pips * size * (10000 if pip_value < 0.01 else 100)
-            decimals = 3 if "JPY" in instrument else 5
+            pnl_diff = (current_price - entry) if direction == "BUY" else (entry - current_price)
+            # pips: JPY pairs = price diff * 100, others = price diff * 10000
+            is_jpy = "JPY" in instrument
+            pnl_pips = pnl_diff * (100 if is_jpy else 10000)
+            # P&L amount in JPY
+            if is_jpy:
+                pnl_amount = pnl_diff * size * 100  # 1 lot = 100 units for mini
+            else:
+                pnl_amount = pnl_diff * size * 10000  # 1 lot = 10000 units for mini
+            total_unrealized += pnl_amount
+            decimals = 3 if is_jpy else 5
 
             positions_table.append({
                 "pair": pair_config.get("name", instrument),
@@ -524,7 +540,8 @@ def api_data() -> Any:
                 "current": f"{current_price:.{decimals}f}",
                 "sl": f"{p.get('sl', 0):.{decimals}f}",
                 "tp": f"{p.get('tp', 0):.{decimals}f}",
-                "pnl": f"{pnl_amount:+,.0f}",
+                "pnl_pips": round(pnl_pips, 1),
+                "pnl": f"¥{pnl_amount:+,.0f}",
                 "pnl_raw": pnl_amount,
                 "pattern": p.get("pattern", ""),
             })
@@ -532,6 +549,8 @@ def api_data() -> Any:
         result = {
             "timestamp": datetime.now().strftime("%H:%M:%S"),
             "balance": f"¥{balance:,.0f}",
+            "unrealized_pnl": f"¥{total_unrealized:+,.0f}",
+            "unrealized_pnl_raw": total_unrealized,
             "daily_pnl": f"¥{account.get('profit_loss', 0):+,.0f}",
             "daily_pnl_raw": account.get("profit_loss", 0),
             "drawdown": "0.0%",
