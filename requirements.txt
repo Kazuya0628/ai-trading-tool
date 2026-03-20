@@ -16,9 +16,6 @@ mplfinance>=0.12.9b7
 matplotlib>=3.8.0
 Pillow>=10.0.0
 
-# Backtesting
-vectorbt>=0.26.0
-
 # Historical Data Download
 yfinance>=0.2.0
 
