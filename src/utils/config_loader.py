@@ -57,6 +57,11 @@ def load_env() -> dict[str, str]:
         # Notifications
         "DISCORD_WEBHOOK_URL": os.getenv("DISCORD_WEBHOOK_URL", ""),
         "LINE_NOTIFY_TOKEN": os.getenv("LINE_NOTIFY_TOKEN", ""),
+        # LINE Messaging API
+        "LINE_CHANNEL_ACCESS_TOKEN": os.getenv("LINE_CHANNEL_ACCESS_TOKEN", ""),
+        "LINE_USER_ID": os.getenv("LINE_USER_ID", ""),
+        # Image hosting for LINE chart messages
+        "IMGBB_API_KEY": os.getenv("IMGBB_API_KEY", ""),
     }
 
     # Validate critical keys based on data source

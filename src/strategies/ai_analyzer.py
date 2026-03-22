@@ -22,7 +22,6 @@ import mplfinance as mpf
 import numpy as np
 import pandas as pd
 from loguru import logger
-from PIL import Image
 
 from src.strategies.pattern_detector import PatternSignal, PatternType, SignalDirection
 
@@ -54,11 +53,10 @@ class AIChartAnalyzer:
     def _init_model(self) -> None:
         """Initialize Gemini model."""
         try:
-            import google.generativeai as genai
-            genai.configure(api_key=self.api_key)
-            model_name = self.config.get("model", "gemini-2.5-flash")
-            self._model = genai.GenerativeModel(model_name)
-            logger.info(f"Gemini model initialized: {model_name}")
+            from google import genai
+            self._model = genai.Client(api_key=self.api_key)
+            self._model_name = self.config.get("model", "gemini-2.5-flash")
+            logger.info(f"Gemini model initialized: {self._model_name}")
         except Exception as e:
             logger.error(f"Failed to initialize Gemini: {e}")
             self._model = None
@@ -189,8 +187,7 @@ class AIChartAnalyzer:
                 return PatternSignal(PatternType.NO_SIGNAL, SignalDirection.NONE, 0)
 
         try:
-            # Convert bytes to PIL Image
-            image = Image.open(io.BytesIO(image_bytes))
+            from google.genai import types as genai_types
 
             # Get prompt
             prompt = self.config.get("prompt_template", self._default_prompt())
@@ -199,7 +196,11 @@ class AIChartAnalyzer:
             self._save_audit_chart(image_bytes, pair_name, timeframe, "analysis")
 
             # Call Gemini
-            response = self._model.generate_content([prompt, image])
+            image_part = genai_types.Part.from_bytes(data=image_bytes, mime_type="image/png")
+            response = self._model.models.generate_content(
+                model=self._model_name,
+                contents=[prompt, image_part],
+            )
 
             if response and response.text:
                 logger.info(
@@ -362,7 +363,8 @@ Return ONLY a JSON object:
             # Save chart image for audit trail
             self._save_audit_chart(image_bytes, pair_name, "", "regime")
 
-            image = Image.open(io.BytesIO(image_bytes))
+            from google.genai import types as genai_types
+            image_part = genai_types.Part.from_bytes(data=image_bytes, mime_type="image/png")
 
             prompt = """Analyze this FX chart to determine the current MARKET REGIME.
 Focus on:
@@ -386,7 +388,10 @@ Risk multiplier guidelines:
 - High volatility + uncertain = 0.4
 - Extreme volatility / news = 0.2 (minimal risk)"""
 
-            response = self._model.generate_content([prompt, image])
+            response = self._model.models.generate_content(
+                model=self._model_name,
+                contents=[prompt, image_part],
+            )
 
             if response and response.text:
                 return self._parse_regime_response(response.text)
