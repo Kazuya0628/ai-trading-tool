@@ -16,6 +16,7 @@ Pillow>=10.0.0
 
 # Historical Data Download
 yfinance>=0.2.0
+matplotlib>=3.7.0
 
 # Utilities
 python-dotenv>=1.0.0

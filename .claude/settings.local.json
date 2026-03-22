@@ -9,7 +9,31 @@
       "Bash(mkdir -p \"$BASE/notebooks\")",
       "Bash(mkdir -p \"$BASE/data/raw\" \"$BASE/data/processed\")",
       "Bash(find \"/Users/k4195255/Library/CloudStorage/OneDrive-共有ライブラリ-\\(有\\)鈴真設計/Switch ROM 共有 - 課題/AiTradeTool\" -not -path '*/.claude/*')",
-      "WebFetch(domain:www.youtube.com)"
+      "WebFetch(domain:www.youtube.com)",
+      "Bash(git config:*)",
+      "Bash(gh auth:*)",
+      "Bash(brew install:*)",
+      "Read(//opt/homebrew/bin/**)",
+      "Read(//usr/local/bin/**)",
+      "Bash(curl -L \"https://github.com/cli/cli/releases/download/v2.88.1/gh_2.88.1_macOS_arm64.zip\" -o /tmp/gh.zip)",
+      "Bash(unzip -o /tmp/gh.zip -d /tmp/gh_cli/)",
+      "Read(//tmp/**)",
+      "Bash(cp /tmp/gh_cli/gh_2.88.1_macOS_arm64/bin/gh /usr/local/bin/gh)",
+      "Bash(sudo cp:*)",
+      "Bash(mkdir -p ~/bin)",
+      "Bash(cp /tmp/gh_cli/gh_2.88.1_macOS_arm64/bin/gh ~/bin/gh)",
+      "Bash(echo \"export PATH=\"\"$HOME/bin:$PATH\"\"\")",
+      "Bash(export PATH=\"$HOME/bin:$PATH\")",
+      "Bash(~/bin/gh --version)",
+      "Bash(gh repo:*)",
+      "Read(//Users/k4195255/.claude/**)",
+      "Bash(pkill -f \"claude\")",
+      "Bash(gh pr:*)",
+      "Bash(find \"/Users/k4195255/Library/CloudStorage/OneDrive-共有ライブラリ-\\(有\\)鈴真設計/Switch ROM 共有 - 課題/AiTradeTool\" -type f -name \".*\" -o -type f)",
+      "Bash(source venv/bin/activate)",
+      "Bash(python -m pytest tests/ -v)",
+      "Bash(python3 -m venv venv)",
+      "Bash(pip install:*)"
     ]
   }
 }

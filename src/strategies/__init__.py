@@ -8,6 +8,7 @@ from src.strategies.pattern_detector import (
     SignalDirection,
 )
 from src.strategies.strategy_engine import StrategyEngine, TradeSignal
+from src.strategies.ma_cross import MovingAverageCrossStrategy
 
 __all__ = [
     "AIChartAnalyzer",
@@ -17,4 +18,5 @@ __all__ = [
     "SignalDirection",
     "StrategyEngine",
     "TradeSignal",
+    "MovingAverageCrossStrategy",
 ]
