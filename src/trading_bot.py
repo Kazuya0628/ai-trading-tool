@@ -618,48 +618,54 @@ class TradingBot:
         Args:
             positions_df: DataFrame of open positions.
         """
-        if positions_df.empty:
-            # Check if we had tracked positions that are now closed
-            for instrument, trade_info in list(self._open_trades.items()):
-                # Estimate P&L from the closed position
-                pnl = self._estimate_closed_pnl(trade_info)
-                self.risk_manager.record_trade_result(
-                    pnl=pnl,
-                    pattern=trade_info.get("pattern", ""),
-                    instrument=instrument,
-                )
+        # Detect which tracked positions are no longer reported by the broker
+        open_instruments: set[str] = set()
+        if not positions_df.empty and "instrument" in positions_df.columns:
+            open_instruments = set(positions_df["instrument"].tolist())
 
-                # Get exit price for logging
-                try:
-                    price_info = self.data_manager.get_latest_price(instrument)
-                    exit_price = price_info.get("mid", 0)
-                except Exception:
-                    exit_price = 0
+        for instrument, trade_info in list(self._open_trades.items()):
+            if instrument in open_instruments:
+                continue  # still open, handled below
 
-                pair_name = instrument.replace("_", "/")
-                log_trade(
-                    f"CLOSE|{pair_name}|"
-                    f"deal={trade_info.get('deal_id', '')}|"
-                    f"exit={exit_price:.5f}|"
-                    f"pnl={pnl:.2f}|"
-                    f"pattern={trade_info.get('pattern', '')}"
-                )
+            # Position is closed (SL/TP hit or manually closed)
+            pnl = self._estimate_closed_pnl(trade_info)
+            self.risk_manager.record_trade_result(
+                pnl=pnl,
+                pattern=trade_info.get("pattern", ""),
+                instrument=instrument,
+            )
 
-                logger.info(
-                    f"Position closed: {instrument} "
-                    f"deal={trade_info.get('deal_id', 'N/A')} "
-                    f"PnL=¥{pnl:+,.0f}"
-                )
+            try:
+                price_info = self.data_manager.get_latest_price(instrument)
+                exit_price = price_info.get("mid", 0)
+            except Exception:
+                exit_price = 0
 
-                # Notify
-                self.notifier.trade_closed(
-                    pair=pair_name,
-                    direction=trade_info.get("direction", ""),
-                    pnl=pnl,
-                    pips=0,
-                )
+            pair_name = instrument.replace("_", "/")
+            log_trade(
+                f"CLOSE|{pair_name}|"
+                f"deal={trade_info.get('deal_id', '')}|"
+                f"exit={exit_price:.5f}|"
+                f"pnl={pnl:.2f}|"
+                f"pattern={trade_info.get('pattern', '')}"
+            )
 
-                del self._open_trades[instrument]
+            logger.info(
+                f"Position closed: {instrument} "
+                f"deal={trade_info.get('deal_id', 'N/A')} "
+                f"PnL=¥{pnl:+,.0f}"
+            )
+
+            self.notifier.trade_closed(
+                pair=pair_name,
+                direction=trade_info.get("direction", ""),
+                pnl=pnl,
+                pips=0,
+            )
+
+            del self._open_trades[instrument]
+
+        if not self._open_trades:
             return
 
         # Update trailing stops for open positions
