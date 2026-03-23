@@ -9,9 +9,11 @@ Implements AI Sennin's approach:
 
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import tempfile
+import time
 from pathlib import Path
 from typing import Any
 
@@ -47,6 +49,10 @@ class AIChartAnalyzer:
         self.api_key = api_key
         self.config = config or {}
         self._model = None
+
+        # In-memory cache: key -> {"result": ..., "expires_at": float}
+        self._cache: dict[str, dict] = {}
+        self._cache_ttl: int = self.config.get("cache_ttl_seconds", 3600)  # 1h default
 
         if api_key:
             self._init_model()
@@ -188,6 +194,13 @@ class AIChartAnalyzer:
             if image_bytes is None:
                 return PatternSignal(PatternType.NO_SIGNAL, SignalDirection.NONE, 0)
 
+        # Cache check: key = hash(pair_name + timeframe + last bar timestamp)
+        cache_key = self._make_cache_key("chart", pair_name, timeframe, df)
+        cached = self._get_cache(cache_key)
+        if cached is not None:
+            logger.info(f"[Gemini] Cache hit: {pair_name} {timeframe} chart analysis")
+            return cached
+
         try:
             # Convert bytes to PIL Image
             image = Image.open(io.BytesIO(image_bytes))
@@ -217,6 +230,7 @@ class AIChartAnalyzer:
                     )
                 else:
                     logger.info(f"[Gemini] {pair_name}: No signal detected")
+                self._set_cache(cache_key, result)
                 return result
             else:
                 logger.warning("Empty response from Gemini")
@@ -353,6 +367,13 @@ Return ONLY a JSON object:
         if not self._model:
             return self._fallback_regime_analysis(df)
 
+        # Cache check
+        cache_key = self._make_cache_key("regime", pair_name, "", df)
+        cached = self._get_cache(cache_key)
+        if cached is not None:
+            logger.info(f"[Gemini] Cache hit: {pair_name} regime analysis")
+            return cached
+
         try:
             # Generate chart image for regime analysis
             image_bytes = self.generate_chart_image(df, pair_name, "Regime Analysis")
@@ -389,13 +410,46 @@ Risk multiplier guidelines:
             response = self._model.generate_content([prompt, image])
 
             if response and response.text:
-                return self._parse_regime_response(response.text)
+                result = self._parse_regime_response(response.text)
+                self._set_cache(cache_key, result)
+                return result
             else:
                 return self._fallback_regime_analysis(df)
 
         except Exception as e:
             logger.error(f"AI regime analysis failed: {e}")
             return self._fallback_regime_analysis(df)
+
+    # --------------------------------------------------
+    # Cache helpers
+    # --------------------------------------------------
+
+    def _make_cache_key(
+        self, kind: str, pair_name: str, timeframe: str, df: pd.DataFrame | None
+    ) -> str:
+        """Build a cache key from request parameters."""
+        last_ts = ""
+        if df is not None and not df.empty:
+            last_ts = str(df.index[-1])
+        raw = f"{kind}|{pair_name}|{timeframe}|{last_ts}"
+        return hashlib.md5(raw.encode()).hexdigest()
+
+    def _get_cache(self, key: str) -> Any | None:
+        """Return cached value if still valid, else None."""
+        entry = self._cache.get(key)
+        if entry and time.time() < entry["expires_at"]:
+            return entry["result"]
+        return None
+
+    def _set_cache(self, key: str, result: Any) -> None:
+        """Store result in cache with TTL."""
+        self._cache[key] = {
+            "result": result,
+            "expires_at": time.time() + self._cache_ttl,
+        }
+        # Evict stale entries to prevent unbounded growth
+        now = time.time()
+        self._cache = {k: v for k, v in self._cache.items() if v["expires_at"] > now}
 
     def _parse_regime_response(self, text: str) -> dict[str, Any]:
         """Parse Gemini regime analysis response.

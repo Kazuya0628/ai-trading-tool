@@ -26,6 +26,7 @@ from loguru import logger
 
 from src.data.indicators import TechnicalAnalyzer
 from src.data.market_data import MarketDataManager
+from src.models.position_store import PositionStore
 from src.models.risk_manager import RiskManager
 from src.strategies.ai_analyzer import AIChartAnalyzer
 from src.strategies.pattern_detector import PatternDetector, SignalDirection
@@ -96,6 +97,9 @@ class TradingBot:
             },
         )
 
+        # Initialize position store (SQLite)
+        self.position_store = PositionStore()
+
         # Initialize risk manager
         self.risk_manager = RiskManager(self.config.risk_management)
 
@@ -121,116 +125,45 @@ class TradingBot:
         # State tracking
         self._running = False
         self._open_trades: dict[str, dict[str, Any]] = {}
+        self._last_summary_date: str = ""
         self._restore_open_trades()
 
     def _restore_open_trades(self) -> None:
-        """Restore open positions from trade log on startup."""
-        trade_log = Path("logs/trades.log")
-        if not trade_log.exists():
-            return
-
-        opens: dict[str, dict[str, Any]] = {}
-        closed: set[str] = set()
+        """Restore open positions from SQLite DB on startup."""
         try:
-            with open(trade_log) as f:
-                for line in f:
-                    if " | " not in line:
-                        continue
-                    _, _, trade_part = line.partition(" | ")
-                    trade_part = trade_part.strip()
+            positions = self.position_store.get_open_positions()
+            if not positions:
+                return
 
-                    if trade_part.startswith("OPEN|"):
-                        parts = trade_part.split("|")
-                        if len(parts) >= 7:
-                            pair_name = parts[1]
-                            direction = parts[2]
-                            fields = {}
-                            for p in parts[3:]:
-                                if "=" in p:
-                                    k, v = p.split("=", 1)
-                                    fields[k] = v
-                            instrument = pair_name.replace("/", "_")
-                            opens[instrument] = {
-                                "deal_id": fields.get("deal", ""),
-                                "direction": direction,
-                                "entry_price": float(fields.get("entry", 0)),
-                                "stop_loss": float(fields.get("sl", 0)),
-                                "take_profit": float(fields.get("tp", 0)),
-                                "size": float(fields.get("size", 0)),
-                                "pattern": fields.get("pattern", ""),
-                                "instrument": instrument,
-                            }
+            for pos in positions:
+                instrument = pos["instrument"]
+                self._open_trades[instrument] = pos
+                if hasattr(self.broker, "_paper_positions"):
+                    self.broker._paper_positions[instrument] = {
+                        "deal_id": pos.get("deal_id", ""),
+                        "direction": pos.get("direction", ""),
+                        "entry_price": pos.get("entry_price", 0),
+                        "size": pos.get("size", 0),
+                        "stop_loss": pos.get("stop_loss", 0),
+                        "take_profit": pos.get("take_profit", 0),
+                        "trailing_stop": False,
+                        "opened_at": pos.get("opened_at", ""),
+                    }
 
-                    elif trade_part.startswith("CLOSE|"):
-                        parts = trade_part.split("|")
-                        if len(parts) >= 2:
-                            instrument = parts[1].replace("/", "_")
-                            closed.add(instrument)
+            # Restore deal_id counter
+            if hasattr(self.broker, "_next_deal_id"):
+                self.broker._next_deal_id = self.position_store.get_next_deal_id()
 
-            # Remove closed positions
-            for inst in closed:
-                opens.pop(inst, None)
-
-            if opens:
-                self._open_trades = opens
-                # Also restore into broker's paper positions so broker
-                # knows about existing positions (prevents deal_id reuse, etc.)
-                for inst, trade in opens.items():
-                    if hasattr(self.broker, "_paper_positions"):
-                        self.broker._paper_positions[inst] = {
-                            "deal_id": trade.get("deal_id", ""),
-                            "direction": trade.get("direction", ""),
-                            "entry_price": trade.get("entry_price", 0),
-                            "size": trade.get("size", 0),
-                            "stop_loss": trade.get("stop_loss", 0),
-                            "take_profit": trade.get("take_profit", 0),
-                            "trailing_stop": False,
-                            "opened_at": "",
-                        }
-                # Restore deal_id counter to avoid reuse
-                if hasattr(self.broker, "_next_deal_id"):
-                    max_id = 0
-                    for trade in opens.values():
-                        deal = trade.get("deal_id", "")
-                        if deal.startswith("PAPER-"):
-                            try:
-                                num = int(deal.replace("PAPER-", ""))
-                                max_id = max(max_id, num)
-                            except ValueError:
-                                pass
-                    self.broker._next_deal_id = max_id + 1
-
-                logger.info(
-                    f"Restored {len(opens)} open positions from log: "
-                    f"{list(opens.keys())}"
-                )
+            logger.info(
+                f"Restored {len(positions)} open positions from DB: "
+                f"{list(self._open_trades.keys())}"
+            )
         except Exception as e:
-            logger.error(f"Failed to restore positions from log: {e}")
+            logger.error(f"Failed to restore positions from DB: {e}")
 
     def _has_open_position_in_log(self, instrument: str) -> bool:
-        """Check if a position is open for the given instrument in trade log."""
-        trade_log = Path("logs/trades.log")
-        if not trade_log.exists():
-            return False
-
-        pair_name = instrument.replace("_", "/")
-        open_count = 0
-        close_count = 0
-        try:
-            with open(trade_log) as f:
-                for line in f:
-                    if " | " not in line:
-                        continue
-                    _, _, trade_part = line.partition(" | ")
-                    trade_part = trade_part.strip()
-                    if trade_part.startswith(f"OPEN|{pair_name}|"):
-                        open_count += 1
-                    elif trade_part.startswith(f"CLOSE|{pair_name}|"):
-                        close_count += 1
-        except Exception:
-            return False
-
-        return open_count > close_count
+        """Check if a position is open for the given instrument."""
+        return self.position_store.has_open_position(instrument)
 
     # --------------------------------------------------
     # Main Trading Loop
@@ -277,6 +210,44 @@ class TradingBot:
             self.notifier.alert(f"FATAL ERROR: {e}")
         finally:
             self.stop()
+
+    def _send_daily_summary(self, date: str) -> None:
+        """Send daily P&L summary via LINE notification."""
+        try:
+            history = self.position_store.get_trade_history(limit=100)
+            day_trades = [t for t in history if (t.get("closed_at") or "").startswith(date)]
+            daily_pnl = sum(t.get("pnl") or 0 for t in day_trades)
+            wins = [t for t in day_trades if (t.get("pnl") or 0) > 0]
+            losses = [t for t in day_trades if (t.get("pnl") or 0) < 0]
+            win_rate = len(wins) / len(day_trades) * 100 if day_trades else 0
+
+            pnl_sign = "+" if daily_pnl >= 0 else ""
+            emoji = "✅" if daily_pnl >= 0 else "❌"
+
+            lines = [
+                f"{emoji} デイリーサマリー ({date})",
+                f"損益: {pnl_sign}¥{daily_pnl:,.0f}",
+                f"取引数: {len(day_trades)}件 (勝: {len(wins)} / 負: {len(losses)})",
+                f"勝率: {win_rate:.0f}%",
+            ]
+            if day_trades:
+                best = max(day_trades, key=lambda t: t.get("pnl") or 0)
+                worst = min(day_trades, key=lambda t: t.get("pnl") or 0)
+                lines.append(
+                    f"最良: {best.get('pair_name', '')} {best.get('pnl', 0):+,.0f}円"
+                )
+                lines.append(
+                    f"最悪: {worst.get('pair_name', '')} {worst.get('pnl', 0):+,.0f}円"
+                )
+
+            open_pos = self.position_store.get_open_positions()
+            lines.append(f"保有中ポジション: {len(open_pos)}件")
+
+            message = "\n".join(lines)
+            logger.info(f"Sending daily summary for {date}")
+            self.notifier.send("デイリーサマリー", message)
+        except Exception as e:
+            logger.error(f"Failed to send daily summary: {e}")
 
     def stop(self) -> None:
         """Stop the trading bot and disconnect."""
@@ -349,6 +320,12 @@ class TradingBot:
             f"regime={adaptive.get('market_regime', 'N/A')} | "
             f"win_rate={adaptive.get('recent_win_rate', 'N/A')}"
         )
+
+        # Send daily summary when the date rolls over (triggers once per day)
+        today = datetime.now().strftime("%Y-%m-%d")
+        if self._last_summary_date and self._last_summary_date != today:
+            self._send_daily_summary(self._last_summary_date)
+        self._last_summary_date = today
 
     def _update_market_regime(self) -> None:
         """Run AI market regime analysis to update adaptive risk parameters."""
@@ -569,9 +546,10 @@ class TradingBot:
 
         if result.get("success"):
             deal_id = result["deal_id"]
-            self._open_trades[instrument] = {
+            trade_info = {
                 "deal_id": deal_id,
                 "instrument": instrument,
+                "pair_name": pair_name,
                 "direction": signal.direction.value,
                 "entry_price": result.get("level", signal.entry_price),
                 "stop_loss": signal.stop_loss,
@@ -580,6 +558,8 @@ class TradingBot:
                 "pattern": signal.pattern.value,
                 "opened_at": datetime.now().isoformat(),
             }
+            self._open_trades[instrument] = trade_info
+            self.position_store.save_position(trade_info)
 
             log_trade(
                 f"OPEN|{pair_name}|{signal.direction.value}|"
@@ -637,6 +617,12 @@ class TradingBot:
                     exit_price = 0
 
                 pair_name = instrument.replace("_", "/")
+                self.position_store.close_position(
+                    deal_id=trade_info.get("deal_id", ""),
+                    exit_price=exit_price,
+                    pnl=pnl,
+                )
+
                 log_trade(
                     f"CLOSE|{pair_name}|"
                     f"deal={trade_info.get('deal_id', '')}|"

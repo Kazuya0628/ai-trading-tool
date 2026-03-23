@@ -470,16 +470,21 @@ class TwelveDataClient:
         self,
         endpoint: str,
         params: dict[str, Any] | None = None,
+        _retry: int = 0,
     ) -> dict[str, Any] | None:
-        """Make a rate-limited API request.
+        """Make a rate-limited API request with exponential backoff retry.
 
         Args:
             endpoint: API endpoint path.
             params: Query parameters.
+            _retry: Current retry count (internal use).
 
         Returns:
             Response JSON or None.
         """
+        max_retries = 4
+        base_wait = 5.0  # 初回リトライ待機秒数
+
         if self._session is None:
             self._session = requests.Session()
 
@@ -506,15 +511,39 @@ class TwelveDataClient:
             if data.get("status") == "error":
                 code = data.get("code", 0)
                 if code == 429:
-                    logger.warning("Rate limited by Twelve Data, waiting 60s...")
-                    time.sleep(60)
-                    return self._request(endpoint, params)
+                    wait = 60
+                    logger.warning(f"Rate limited by Twelve Data, waiting {wait}s...")
+                    time.sleep(wait)
+                    return self._request(endpoint, params, _retry)
                 logger.error(f"Twelve Data error: {data.get('message', data)}")
                 return data
 
             return data
 
+        except requests.exceptions.ConnectionError as e:
+            if _retry < max_retries:
+                wait = base_wait * (2 ** _retry)
+                logger.warning(f"Connection error, retry {_retry + 1}/{max_retries} in {wait:.0f}s: {e}")
+                time.sleep(wait)
+                self._session = requests.Session()  # セッションをリセット
+                return self._request(endpoint, params, _retry + 1)
+            logger.error(f"Twelve Data connection failed after {max_retries} retries: {e}")
+            return None
+        except requests.exceptions.Timeout as e:
+            if _retry < max_retries:
+                wait = base_wait * (2 ** _retry)
+                logger.warning(f"Timeout, retry {_retry + 1}/{max_retries} in {wait:.0f}s")
+                time.sleep(wait)
+                return self._request(endpoint, params, _retry + 1)
+            logger.error(f"Twelve Data request timed out after {max_retries} retries: {e}")
+            return None
         except requests.exceptions.HTTPError as e:
+            status = e.response.status_code if e.response is not None else 0
+            if status in (500, 502, 503, 504) and _retry < max_retries:
+                wait = base_wait * (2 ** _retry)
+                logger.warning(f"Server error {status}, retry {_retry + 1}/{max_retries} in {wait:.0f}s")
+                time.sleep(wait)
+                return self._request(endpoint, params, _retry + 1)
             logger.error(f"Twelve Data HTTP error: {e}")
             return None
         except requests.exceptions.RequestException as e:
