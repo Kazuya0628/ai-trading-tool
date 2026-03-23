@@ -90,6 +90,9 @@ class BacktestEngine:
         self.initial_capital = self.config.get("initial_capital", 1_000_000)
         self.commission = self.config.get("commission_per_trade", 0)
         self.slippage_pips = self.config.get("slippage_pips", 0.5)
+        # spread_pips: bid/ask spread cost applied at entry.
+        # USD/JPY ≈ 0.3 pip, EUR/USD ≈ 0.2 pip. Default 0.3.
+        self.spread_pips = self.config.get("spread_pips", 0.3)
         self.adaptive_config = self.config.get("adaptive", {})
 
     def run(
@@ -115,6 +118,12 @@ class BacktestEngine:
         equity = self.initial_capital
         equity_curve = [equity]
         peak_equity = equity
+
+        # Compute actual backtest period for correct Sharpe annualization
+        try:
+            period_days = max(1, (df.index[-1] - df.index[0]).days)
+        except Exception:
+            period_days = max(1, len(df) // 6)  # fallback: assume 4H bars
 
         close = df["close"].values
         high = df["high"].values
@@ -216,6 +225,8 @@ class BacktestEngine:
                     else:
                         pnl = (entry_price - exit_price) * size
 
+                    # Deduct spread cost (paid at entry as bid/ask difference)
+                    pnl -= self.spread_pips * pip_value * size
                     pnl -= self.commission
                     pnl_pips = abs(exit_price - entry_price) / pip_value
 
@@ -253,6 +264,7 @@ class BacktestEngine:
                     pnl = (exit_price - entry_price) * size
                 else:
                     pnl = (entry_price - exit_price) * size
+                pnl -= self.spread_pips * pip_value * size
 
                 trade = BacktestTrade(
                     entry_bar=bar_idx,
@@ -276,10 +288,11 @@ class BacktestEngine:
 
                 position = None
 
-        return self._calculate_metrics(trades, equity_curve)
+        return self._calculate_metrics(trades, equity_curve, period_days)
 
     def _calculate_metrics(
-        self, trades: list[BacktestTrade], equity_curve: list[float]
+        self, trades: list[BacktestTrade], equity_curve: list[float],
+        period_days: int = 252,
     ) -> BacktestResult:
         """Calculate performance metrics from trades.
 
@@ -327,16 +340,30 @@ class BacktestEngine:
         result.max_drawdown = max_dd
         result.max_drawdown_pct = max_dd_pct
 
-        # Sharpe Ratio (annualized)
-        if len(pnls) > 1:
-            returns = np.array(pnls) / self.initial_capital
-            result.sharpe_ratio = (
-                np.mean(returns) / np.std(returns) * np.sqrt(252)
-                if np.std(returns) > 0 else 0
-            )
+        # Sharpe Ratio (annualized, per-trade based)
+        # Formula: mean(R) / std(R) * sqrt(annual_trade_frequency)
+        # where R_i = pnl_i / equity_at_entry_i (approximated by equity_curve[i])
+        # and annual_trade_frequency = N_trades * (252 / period_days)
+        if len(pnls) > 1 and period_days > 0:
+            # Use equity_curve as proxy for equity at each trade's entry
+            per_trade_equity = [
+                equity_curve[i] if i < len(equity_curve) else self.initial_capital
+                for i in range(len(pnls))
+            ]
+            trade_returns = np.array([
+                pnl / eq for pnl, eq in zip(pnls, per_trade_equity)
+                if eq > 0
+            ])
+            std = np.std(trade_returns)
+            if std > 0 and len(trade_returns) > 1:
+                # Annualize: trades per year = N * (252 / period_days)
+                annual_factor = len(trade_returns) * 252 / period_days
+                result.sharpe_ratio = (
+                    np.mean(trade_returns) / std * np.sqrt(annual_factor)
+                )
 
-        # Calmar Ratio
-        annual_return = result.total_pnl / self.initial_capital
+        # Calmar Ratio — annualize the return to the actual period first
+        annual_return = (result.total_pnl / self.initial_capital) * (365 / period_days)
         result.calmar_ratio = (
             annual_return / result.max_drawdown_pct
             if result.max_drawdown_pct > 0 else 0

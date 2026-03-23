@@ -510,16 +510,17 @@ class PatternDetector:
         if len(df) < lookback + 5:
             return PatternSignal(PatternType.NO_SIGNAL, SignalDirection.NONE, 0)
 
-        # Channel boundaries from lookback period (excluding latest bar)
-        channel_data = df.iloc[-(lookback + 1):-1]
+        # Channel boundaries from lookback period (excluding latest 2 bars)
+        channel_data = df.iloc[-(lookback + 2):-2]
         channel_high = float(channel_data["high"].max())
         channel_low = float(channel_data["low"].min())
 
         current_close = float(df["close"].iloc[-1])
+        prev_close = float(df["close"].iloc[-2])  # previous bar's close
         atr = float(df["atr"].iloc[-1]) if "atr" in df.columns else 0
 
-        # Bullish breakout
-        if current_close > channel_high:
+        # Bullish breakout — require FRESH breakout (prev bar was still inside channel)
+        if current_close > channel_high and prev_close <= channel_high:
             breakout_size = current_close - channel_high
             if atr > 0 and breakout_size >= atr * 0.5:
                 confidence = min(50 + (breakout_size / atr) * 20, 90)
@@ -533,12 +534,12 @@ class PatternDetector:
                     take_profit=current_close + channel_width,
                     support=channel_low,
                     resistance=channel_high,
-                    reasoning=f"Bullish breakout above {channel_high:.5f}",
+                    reasoning=f"Fresh bullish breakout above {channel_high:.5f}",
                     bar_index=len(df) - 1,
                 )
 
-        # Bearish breakout
-        if current_close < channel_low:
+        # Bearish breakout — require FRESH breakout (prev bar was still inside channel)
+        if current_close < channel_low and prev_close >= channel_low:
             breakout_size = channel_low - current_close
             if atr > 0 and breakout_size >= atr * 0.5:
                 confidence = min(50 + (breakout_size / atr) * 20, 90)
@@ -552,7 +553,7 @@ class PatternDetector:
                     take_profit=current_close - channel_width,
                     support=channel_low,
                     resistance=channel_high,
-                    reasoning=f"Bearish breakout below {channel_low:.5f}",
+                    reasoning=f"Fresh bearish breakout below {channel_low:.5f}",
                     bar_index=len(df) - 1,
                 )
 

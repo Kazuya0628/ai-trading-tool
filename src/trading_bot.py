@@ -775,23 +775,34 @@ class TradingBot:
         df = self.tech_analyzer.add_all_indicators(df)
 
         # Detect patterns on all bars
+        # MIN_SIGNAL_GAP: same pattern+direction must be at least this many bars apart.
+        # Prevents the same pattern from firing 30+ times as the sliding window passes over it.
+        MIN_SIGNAL_GAP = 20  # 20 × 4H = 80 hours minimum between same signals
+
         signals = []
+        last_signal_bar: dict[str, int] = {}  # key: "pattern_direction" -> last bar_index
         window_size = 100
         for i in range(window_size, len(df)):
             window = df.iloc[i - window_size:i + 1]
             patterns = self.pattern_detector.detect_all_patterns(window)
             for p in patterns:
-                if p.is_valid and p.confidence >= 50:
-                    signals.append({
-                        "bar_index": i,
-                        "direction": p.direction.value,
-                        "entry_price": p.entry_price,
-                        "stop_loss": p.stop_loss,
-                        "take_profit": p.take_profit,
-                        "pattern": p.pattern.value,
-                    })
+                if not p.is_valid or p.confidence < 50:
+                    continue
+                key = f"{p.pattern.value}_{p.direction.value}"
+                last_bar = last_signal_bar.get(key, -MIN_SIGNAL_GAP - 1)
+                if i - last_bar < MIN_SIGNAL_GAP:
+                    continue  # same pattern fired too recently — skip duplicate
+                signals.append({
+                    "bar_index": i,
+                    "direction": p.direction.value,
+                    "entry_price": p.entry_price,
+                    "stop_loss": p.stop_loss,
+                    "take_profit": p.take_profit,
+                    "pattern": p.pattern.value,
+                })
+                last_signal_bar[key] = i
 
-        logger.info(f"Generated {len(signals)} signals for backtest")
+        logger.info(f"Generated {len(signals)} signals for backtest (deduped, gap={MIN_SIGNAL_GAP} bars)")
 
         # Run backtest
         pair_config = self.config.pair_configs.get(instrument, {})
