@@ -220,6 +220,7 @@ DASHBOARD_HTML = """
                 <tr>
                     <th>Pair</th><th>Direction</th><th>Lots</th><th>Entry</th>
                     <th>Current</th><th>SL</th><th>TP</th><th>P&L (pips)</th><th>P&L (¥)</th><th>Pattern</th>
+                    <th>保有時刻</th><th>経過</th>
                 </tr>
             </thead>
             <tbody id="positions-body"></tbody>
@@ -369,9 +370,23 @@ DASHBOARD_HTML = """
                 // Update positions table
                 const tbody = document.getElementById('positions-body');
                 if (data.positions.length === 0) {
-                    tbody.innerHTML = '<tr><td colspan="10" style="text-align:center;color:#555;">No open positions</td></tr>';
+                    tbody.innerHTML = '<tr><td colspan="12" style="text-align:center;color:#555;">No open positions</td></tr>';
                 } else {
-                    tbody.innerHTML = data.positions.map(p => `
+                    const now = new Date();
+                    tbody.innerHTML = data.positions.map(p => {
+                        // 経過時間を計算
+                        let elapsedStr = '-';
+                        if (p.opened_at) {
+                            const opened = new Date(p.opened_at.replace(' ', 'T'));
+                            const diffMs = now - opened;
+                            const diffMins = Math.floor(diffMs / 60000);
+                            const h = Math.floor(diffMins / 60);
+                            const m = diffMins % 60;
+                            elapsedStr = h > 0 ? `${h}h ${m}m` : `${m}m`;
+                        }
+                        // 保有時刻は月/日 時:分 表示
+                        const openedLabel = p.opened_at ? p.opened_at.slice(5, 16) : '-';
+                        return `
                         <tr>
                             <td>${p.pair}</td>
                             <td><span class="${p.direction === 'BUY' ? 'buy-badge' : 'sell-badge'}">${p.direction}</span></td>
@@ -383,8 +398,10 @@ DASHBOARD_HTML = """
                             <td style="color:${p.pnl_pips >= 0 ? '#22c55e' : '#ef4444'};font-weight:600">${p.pnl_pips >= 0 ? '+' : ''}${p.pnl_pips.toFixed(1)} pips</td>
                             <td style="color:${p.pnl_raw >= 0 ? '#22c55e' : '#ef4444'};font-weight:600">${p.pnl}</td>
                             <td>${p.pattern}</td>
-                        </tr>
-                    `).join('');
+                            <td style="color:#888;font-size:0.85em">${openedLabel}</td>
+                            <td style="color:#facc15;font-size:0.85em">${elapsedStr}</td>
+                        </tr>`;
+                    }).join('');
                 }
 
                 document.getElementById('loading').style.display = 'none';
@@ -544,6 +561,7 @@ def api_data() -> Any:
                 "pnl": f"¥{pnl_amount:+,.0f}",
                 "pnl_raw": pnl_amount,
                 "pattern": p.get("pattern", ""),
+                "opened_at": p.get("opened_at", ""),
             })
 
         result = {
@@ -608,9 +626,10 @@ def api_debug() -> Any:
 
 
 def _get_positions() -> list[dict]:
-    """Read open positions from trade log.
+    """Read open positions from trade log, then overlay SL/TP from SQLite.
 
     Log format: '2026-03-20 08:39:19.288 | OPEN|USD/JPY|SELL|deal=...|entry=...|sl=...|tp=...|size=...|pattern=...'
+    SQLite (data/positions.db) holds the latest SL/TP after --fix-sltp or regime adjustments.
     """
     trade_log = Path("logs/trades.log")
     if not trade_log.exists():
@@ -640,6 +659,10 @@ def _get_positions() -> list[dict]:
                                 k, v = p.split("=", 1)
                                 fields[k] = v
 
+                        # ログ行先頭のタイムスタンプを取得
+                        ts_raw = line.split(" | ")[0].strip()  # "2026-03-20 08:39:19.288"
+                        opened_at = ts_raw[:16]  # "2026-03-20 08:39"
+
                         instrument = pair_name.replace("/", "_")
                         positions[instrument] = {
                             "instrument": instrument,
@@ -649,6 +672,7 @@ def _get_positions() -> list[dict]:
                             "tp": float(fields.get("tp", 0)),
                             "size": float(fields.get("size", 0)),
                             "pattern": fields.get("pattern", ""),
+                            "opened_at": opened_at,
                         }
 
                 elif trade_part.startswith("CLOSE|"):
@@ -663,6 +687,23 @@ def _get_positions() -> list[dict]:
 
     except Exception as e:
         logger.error(f"Error reading trade log: {e}")
+
+    # SQLiteの最新SL/TPで上書き（--fix-sltp やレジーム調整後の値を反映）
+    try:
+        import sys
+        sys.path.insert(0, str(Path(__file__).parent.parent))
+        from src.models.position_store import PositionStore
+        store = PositionStore()
+        db_positions = {p["instrument"]: p for p in store.get_open_positions()}
+        for inst, pos in positions.items():
+            if inst in db_positions:
+                db_pos = db_positions[inst]
+                if db_pos.get("stop_loss"):
+                    pos["sl"] = db_pos["stop_loss"]
+                if db_pos.get("take_profit"):
+                    pos["tp"] = db_pos["take_profit"]
+    except Exception as e:
+        logger.warning(f"Could not overlay SL/TP from SQLite: {e}")
 
     logger.info(f"Positions from log: {list(positions.keys())}")
     return list(positions.values())

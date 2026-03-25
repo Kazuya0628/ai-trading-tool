@@ -594,21 +594,18 @@ Risk multiplier guidelines:
         """
         try:
             from datetime import datetime as dt
-            timestamp = dt.now().strftime("%Y%m%d_%H%M%S")
+            now = dt.now()
+            timestamp = now.strftime("%Y%m%d_%H%M%S")
             safe_pair = pair_name.replace("/", "_").replace(" ", "_")
             filename = f"{timestamp}_{safe_pair}_{analysis_type}.png"
-            output_dir = Path("data/gemini_audit")
+            # 日付フォルダ（YYYY-MM）に整理して全期間永続保管
+            date_folder = now.strftime("%Y-%m")
+            output_dir = Path("data/gemini_audit") / date_folder
             output_dir.mkdir(parents=True, exist_ok=True)
             filepath = output_dir / filename
             with open(filepath, "wb") as f:
                 f.write(image_bytes)
-            logger.info(f"[Gemini] Chart saved: {filepath}")
-
-            # Keep only last 100 audit files to prevent disk bloat
-            files = sorted(output_dir.glob("*.png"), key=lambda f: f.stat().st_mtime)
-            if len(files) > 100:
-                for old_file in files[:-100]:
-                    old_file.unlink()
+            logger.debug(f"[Gemini] Chart saved: {filepath}")
         except Exception as e:
             logger.debug(f"Audit chart save failed (non-critical): {e}")
 

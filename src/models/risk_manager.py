@@ -320,6 +320,20 @@ class RiskManager:
         self.min_sl_pips = self.config.get("min_stop_loss_pips", 10)
         self.max_sl_pips = self.config.get("max_stop_loss_pips", 100)
         self.tp_rr_ratio = self.config.get("take_profit_rr_ratio", 2.0)
+
+        # レジーム別SL/TP倍率テーブル（基準値からの倍率）
+        self._regime_sl_scale = {
+            "trending":       1.00,   # 標準 ATR×2.0
+            "ranging":        0.75,   # 狭め ATR×1.5（値動き小さい）
+            "high_volatility": 1.50,  # 広め ATR×3.0（振れ幅大きい）
+            "caution":        1.25,   # やや広め ATR×2.5（リスク回避）
+        }
+        self._regime_tp_scale = {
+            "trending":       1.00,   # 標準 R:R 2.0
+            "ranging":        0.75,   # 狭め R:R 1.5（利確早め）
+            "high_volatility": 1.25,  # 広め R:R 2.5（伸ばす）
+            "caution":        1.50,   # 大きめ R:R 3.0（リスク回避で慎重に）
+        }
         self.trailing_stop = self.config.get("trailing_stop_enabled", True)
         self.trailing_atr_mult = self.config.get("trailing_stop_atr_multiple", 1.5)
         self.max_daily_loss_pct = self.config.get("max_daily_loss_pct", 2.0)
@@ -500,36 +514,85 @@ class RiskManager:
             risk_pct=adjusted_risk_pct,
         )
 
+    @property
+    def regime_sl_atr_multiple(self) -> float:
+        """現在の相場レジームに応じたSL ATR倍率を返す。"""
+        regime = self.adaptive.market_regime.regime
+        scale = self._regime_sl_scale.get(regime, 1.0)
+        value = round(self.sl_atr_multiple * scale, 2)
+        logger.debug(f"[Regime SL] {regime}: ATR×{value:.2f} (base×{scale})")
+        return value
+
+    @property
+    def regime_tp_rr_ratio(self) -> float:
+        """現在の相場レジームに応じたTP R:R比率を返す。"""
+        regime = self.adaptive.market_regime.regime
+        scale = self._regime_tp_scale.get(regime, 1.0)
+        value = round(self.tp_rr_ratio * scale, 2)
+        logger.debug(f"[Regime TP] {regime}: R:R×{value:.2f} (base×{scale})")
+        return value
+
     def calculate_stop_loss(
         self,
         direction: str,
         entry_price: float,
         atr: float,
         pattern_sl: float = 0,
+        pip_size: float | None = None,
     ) -> float:
-        """Calculate stop-loss level using ATR.
+        """Calculate stop-loss level (regime-adjusted, min/max enforced).
+
+        優先順位:
+          1. パターンSL（チャート構造上の意味がある）
+          2. ATR×レジーム倍率（最低距離の保証）
+          3. min_sl_pips / max_sl_pips で上下限をクランプ
 
         Args:
             direction: 'BUY' or 'SELL'.
             entry_price: Entry price level.
             atr: Current ATR value.
-            pattern_sl: Pattern-based stop-loss (used as reference).
+            pattern_sl: Pattern-based stop-loss (structurally significant).
+            pip_size: Pip size (auto-derived from entry_price if omitted).
 
         Returns:
             Stop-loss price level.
         """
-        atr_stop = atr * self.sl_atr_multiple
+        # pip_size を価格幅から自動推定（JPY系は0.01、それ以外は0.0001）
+        if pip_size is None:
+            pip_size = 0.01 if entry_price > 50 else 0.0001
 
-        if direction == "BUY":
-            sl = entry_price - atr_stop
-            # Use pattern SL if tighter and reasonable
-            if pattern_sl > 0 and pattern_sl < sl:
-                sl = pattern_sl
+        # 1. ATRベース（レジーム調整済み）
+        atr_distance = atr * self.regime_sl_atr_multiple
+        atr_sl = (
+            entry_price - atr_distance if direction == "BUY"
+            else entry_price + atr_distance
+        )
+
+        # 2. パターンSLを優先。ATRは最低距離の保証として使用
+        if pattern_sl > 0:
+            if direction == "BUY":
+                sl = min(pattern_sl, atr_sl)   # より広い（低い）方を採用
+            else:
+                sl = max(pattern_sl, atr_sl)   # より広い（高い）方を採用
         else:
-            sl = entry_price + atr_stop
-            if pattern_sl > 0 and pattern_sl > sl:
-                sl = pattern_sl
+            sl = atr_sl
 
+        # 3. min/max pip bounds を適用
+        sl_distance = abs(entry_price - sl)
+        min_dist = self.min_sl_pips * pip_size
+        max_dist = self.max_sl_pips * pip_size
+        sl_distance = max(min_dist, min(sl_distance, max_dist))
+
+        sl = (
+            entry_price - sl_distance if direction == "BUY"
+            else entry_price + sl_distance
+        )
+
+        logger.debug(
+            f"[SL] {direction} entry={entry_price} atr_sl={atr_sl:.5f} "
+            f"pattern_sl={pattern_sl} → final_sl={sl:.5f} "
+            f"({sl_distance/pip_size:.1f} pips)"
+        )
         return sl
 
     def calculate_take_profit(
@@ -538,7 +601,7 @@ class RiskManager:
         entry_price: float,
         stop_loss: float,
     ) -> float:
-        """Calculate take-profit level based on R:R ratio.
+        """Calculate take-profit level based on R:R ratio (regime-adjusted).
 
         Args:
             direction: 'BUY' or 'SELL'.
@@ -549,7 +612,7 @@ class RiskManager:
             Take-profit price level.
         """
         risk = abs(entry_price - stop_loss)
-        reward = risk * self.tp_rr_ratio
+        reward = risk * self.regime_tp_rr_ratio
 
         if direction == "BUY":
             return entry_price + reward

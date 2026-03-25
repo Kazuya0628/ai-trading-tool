@@ -163,3 +163,14 @@ class TradingConfig:
     @property
     def is_live(self) -> bool:
         return self.env.get("TRADING_MODE", "paper") == "live"
+
+    @property
+    def confidence_threshold(self) -> int:
+        return int(self.risk_management.get("confidence_threshold", 55))
+
+    @confidence_threshold.setter
+    def confidence_threshold(self, value: int) -> None:
+        rm = self.config.setdefault("risk_management", {})
+        lo = int(rm.get("confidence_threshold_min", 50))
+        hi = int(rm.get("confidence_threshold_max", 65))
+        rm["confidence_threshold"] = max(lo, min(hi, value))

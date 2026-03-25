@@ -347,12 +347,96 @@ class Notifier:
             },
         )
 
-    def trade_closed(self, pair: str, direction: str, pnl: float, pips: float) -> None:
+    def trade_closed(
+        self,
+        pair: str,
+        direction: str,
+        pnl: float,
+        pips: float,
+        entry_price: float = 0.0,
+        exit_price: float = 0.0,
+        opened_at: str = "",
+        pattern: str = "",
+        risk_reward: float = 0.0,
+    ) -> None:
         """Notify about a trade closing."""
+        from datetime import datetime
         result = "WIN" if pnl >= 0 else "LOSS"
+        emoji = "✅" if pnl >= 0 else "❌"
+
+        # 保有時間を計算
+        hold_str = ""
+        if opened_at:
+            try:
+                opened_dt = datetime.fromisoformat(opened_at)
+                hold_minutes = int((datetime.now() - opened_dt).total_seconds() / 60)
+                if hold_minutes >= 60:
+                    hold_str = f"{hold_minutes // 60}h{hold_minutes % 60}m"
+                else:
+                    hold_str = f"{hold_minutes}m"
+            except ValueError:
+                hold_str = ""
+
+        decimals = 3 if "JPY" in pair else 5
+        fields: dict[str, Any] = {}
+        if entry_price:
+            fields["Entry"] = f"{entry_price:.{decimals}f}"
+        if exit_price:
+            fields["Exit"] = f"{exit_price:.{decimals}f}"
+        if pips:
+            fields["Pips"] = f"{pips:+.1f}"
+        if pattern:
+            fields["Pattern"] = pattern
+        if risk_reward:
+            fields["R:R"] = f"1:{risk_reward:.1f}"
+        if hold_str:
+            fields["Hold"] = hold_str
+
         self.send(
-            title=f"CLOSED {direction} {pair} ({result})",
-            message=f"P&L: {pnl:+,.0f} ({pips:+.1f} pips)",
+            title=f"{emoji} CLOSED {direction} {pair} ({result})",
+            message=f"P&L: {pnl:+,.0f}",
+            fields=fields,
+        )
+
+    def drawdown_warning(self, drawdown_pct: float, threshold_pct: float, balance: float) -> None:
+        """ドローダウン警告通知。"""
+        self.send(
+            title="⚠️ ドローダウン警告",
+            message=f"現在のドローダウンが{threshold_pct:.0f}%を超えました",
+            fields={
+                "現在DD": f"{drawdown_pct:.1f}%",
+                "残高": f"¥{balance:,.0f}",
+                "対応": "ポジションサイズを自動縮小中",
+            },
+        )
+
+    def regime_changed(
+        self,
+        pair: str,
+        old_regime: str,
+        new_regime: str,
+        volatility: str,
+        trend: str,
+        risk_multiplier: float,
+        reasoning: str,
+    ) -> None:
+        """相場レジーム変化通知。"""
+        self.send(
+            title=f"📊 レジーム変化: {pair}",
+            message=f"{old_regime} → {new_regime}",
+            fields={
+                "ボラティリティ": volatility,
+                "トレンド強度": trend,
+                "リスク倍率": f"×{risk_multiplier:.2f}",
+                "判断理由": reasoning[:80] if reasoning else "-",
+            },
+        )
+
+    def monthly_oos_result(self, result_text: str) -> None:
+        """月次IS/OOS分析結果通知。"""
+        self.send(
+            title="📈 月次IS/OOS分析完了",
+            message=result_text[:500],
         )
 
     def sl_updated(self, pair: str, direction: str, old_sl: float, new_sl: float,

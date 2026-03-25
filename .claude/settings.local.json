@@ -63,7 +63,26 @@
       "Bash(find '/Users/k4195255/Library/CloudStorage/OneDrive-共有ライブラリ-\\(有\\)鈴真設計/Switch ROM 共有 - 課題/AiTradeTool' -name *.py -path */src/* -type f)",
       "Bash(ls -la \"/Users/k4195255/Library/CloudStorage/OneDrive-共有ライブラリ-\\(有\\)鈴真設計/Switch ROM 共有 - 課題/AiTradeTool/src/data/processors/\")",
       "Bash(head -50 '/Users/k4195255/Library/CloudStorage/OneDrive-共有ライブラリ-\\(有\\)鈴真設計/Switch ROM 共有 - 課題/AiTradeTool/src/dashboard.py')",
-      "Bash(chmod +x /Users/k4195255/start-aitrade-dashboard.sh)"
+      "Bash(chmod +x /Users/k4195255/start-aitrade-dashboard.sh)",
+      "Bash(python - 2)",
+      "Bash(1:*)",
+      "Bash(python scripts/sensitivity_analysis.py)",
+      "Bash(chmod +x /Users/k4195255/run-monthly-review.sh)",
+      "Bash(\"/Users/k4195255/Library/CloudStorage/OneDrive-共有ライブラリ-\\(有\\)鈴真設計/Switch ROM 共有 - 課題/AiTradeTool/.env\")",
+      "Bash(echo \"groq>=0.9.0\")",
+      "Bash(\"/Users/k4195255/Library/CloudStorage/OneDrive-共有ライブラリ-\\(有\\)鈴真設計/Switch ROM 共有 - 課題/AiTradeTool/requirements.txt\")",
+      "Bash(python -m py_compile src/utils/notifier.py src/trading_bot.py scripts/sensitivity_analysis.py)",
+      "Bash(python -m py_compile scripts/sensitivity_analysis.py)",
+      "Bash(python -m py_compile src/models/risk_manager.py src/trading_bot.py)",
+      "Bash(python -m py_compile src/dashboard.py)",
+      "Bash(python src/dashboard.py)",
+      "Bash(python src/dashboard.py --port 8080)",
+      "Bash(xargs kill:*)",
+      "Bash(python -m py_compile src/models/risk_manager.py src/trading_bot.py main.py)",
+      "Bash(python main.py --fix-sltp)",
+      "Bash(python -:*)",
+      "Bash(python3 -c \":*)",
+      "Bash(ls \"/Users/k4195255/Library/CloudStorage/OneDrive-共有ライブラリ-\\(有\\)鈴真設計/Switch ROM 共有 - 課題/AiTradeTool/venv/bin/python\")"
     ]
   }
 }

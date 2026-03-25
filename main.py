@@ -82,6 +82,10 @@ Examples:
         "--analyze", type=str, default=None,
         help="Analyze a specific instrument and show signals (e.g., USD_JPY)",
     )
+    parser.add_argument(
+        "--fix-sltp", action="store_true",
+        help="Recalculate and update SL/TP for all open positions immediately",
+    )
 
     args = parser.parse_args()
 
@@ -98,6 +102,8 @@ Examples:
         _run_backtest(bot, instrument, args.resolution, args.csv, args.download, args.years)
     elif args.analyze:
         _analyze_pair(bot, args.analyze)
+    elif args.fix_sltp:
+        _fix_sltp(bot)
     else:
         # Start trading bot (paper mode)
         bot.start()
@@ -176,6 +182,43 @@ def _run_backtest(
         if result:
             print(json.dumps(result, indent=2))
 
+    bot.broker.disconnect()
+
+
+def _fix_sltp(bot: TradingBot) -> None:
+    """Recalculate and apply corrected SL/TP to all open positions."""
+    if not bot.broker.connect():
+        logger.error("Failed to connect to broker")
+        return
+
+    print("\n" + "=" * 50)
+    print("  SL/TP 修正モード")
+    print("=" * 50)
+
+    open_trades = bot._open_trades
+    if not open_trades:
+        print("\n  保有ポジションなし\n")
+        bot.broker.disconnect()
+        return
+
+    print(f"\n  対象ポジション: {len(open_trades)}件")
+    for inst, info in open_trades.items():
+        decimals = 3 if "JPY" in inst else 5
+        print(f"  {inst}: {info.get('direction')} "
+              f"SL={info.get('stop_loss', 0):.{decimals}f} "
+              f"TP={info.get('take_profit', 0):.{decimals}f}")
+
+    print("\n  修正中...")
+    bot.fix_open_positions_sltp()
+
+    print("\n  修正後:")
+    for inst, info in open_trades.items():
+        decimals = 3 if "JPY" in inst else 5
+        print(f"  {inst}: {info.get('direction')} "
+              f"SL={info.get('stop_loss', 0):.{decimals}f} "
+              f"TP={info.get('take_profit', 0):.{decimals}f}")
+
+    print("\n" + "=" * 50 + "\n")
     bot.broker.disconnect()
 
 

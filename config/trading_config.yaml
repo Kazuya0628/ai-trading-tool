@@ -198,6 +198,12 @@ risk_management:
   max_drawdown_pct: 10.0           # Stop all trading if drawdown > 10%
   drawdown_cooldown_hours: 24
 
+  # Signal confidence threshold (auto-adjusted weekly based on PF)
+  confidence_threshold: 55             # Minimum AI confidence % to accept signal
+  confidence_threshold_min: 50         # Floor: never go below this
+  confidence_threshold_max: 65         # Ceiling: never go above this
+  confidence_threshold_step: 5         # Step size for weekly auto-adjustment
+
   # Adaptive Risk Control (AI-driven dynamic adjustment)
   adaptive:
     performance_window: 20           # Rolling window of recent trades

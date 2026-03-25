@@ -100,6 +100,14 @@ class TradingBot:
         # Initialize position store (SQLite)
         self.position_store = PositionStore()
 
+        # Initialize Groq reviewer（相場レジーム判断＋週次戦略レビュー）
+        from src.strategies.groq_reviewer import GroqReviewer
+        from src.data.sentiment_fetcher import SentimentFetcher
+        self.groq_reviewer = GroqReviewer()
+        self.sentiment_fetcher = SentimentFetcher()
+        self._last_sentiment: dict = {}          # センチメントキャッシュ（1時間）
+        self._last_sentiment_ts: float = 0.0
+
         # Initialize risk manager
         self.risk_manager = RiskManager(self.config.risk_management)
 
@@ -126,6 +134,9 @@ class TradingBot:
         self._running = False
         self._open_trades: dict[str, dict[str, Any]] = {}
         self._last_summary_date: str = ""
+        self._last_weekly_review_date: str = ""   # 週次閾値見直し用
+        self._dd_warned_levels: set[float] = set()  # ドローダウン警告済みレベル
+        self._prev_regime: str = ""                  # 前回の相場レジーム
         self._restore_open_trades()
 
     def _restore_open_trades(self) -> None:
@@ -249,6 +260,103 @@ class TradingBot:
         except Exception as e:
             logger.error(f"Failed to send daily summary: {e}")
 
+    def _weekly_threshold_review(self) -> None:
+        """週次戦略レビュー。
+
+        フロー:
+        1. 直近20トレードのPFを計算（ルールベース）
+        2. PFが境界値を超えた場合、Groq AIに変更の妥当性を問い合わせ
+        3. AIが承認した場合のみ閾値を変更
+        4. 結果をLINEで通知
+        """
+        try:
+            rm = self.config.risk_management
+            step = int(rm.get("confidence_threshold_step", 5))
+            current = self.config.confidence_threshold
+
+            history = self.position_store.get_trade_history(limit=20)
+            if len(history) < 10:
+                logger.info("[週次レビュー] トレード数が少ないため閾値調整をスキップ")
+                return
+
+            pnls = [t.get("pnl") or 0.0 for t in history]
+            gross_profit = sum(p for p in pnls if p > 0)
+            gross_loss = abs(sum(p for p in pnls if p < 0))
+            pf = gross_profit / gross_loss if gross_loss > 0 else float("inf")
+
+            # ルールによる提案
+            if pf >= 1.3:
+                proposed = current + step
+                rule_reason = f"PF={pf:.2f} >= 1.3 → 引き上げ提案"
+            elif pf < 1.0:
+                proposed = current - step
+                rule_reason = f"PF={pf:.2f} < 1.0 → 引き下げ提案"
+            else:
+                logger.info(
+                    f"[週次レビュー] PF={pf:.2f} (1.0〜1.3) → 閾値 {current}% 維持"
+                )
+                return
+
+            # 現在の相場レジームを取得（Geminiが設定している値）
+            regime_info = "不明"
+            try:
+                ar = self.risk_manager.adaptive
+                if hasattr(ar, "market_regime") and ar.market_regime:
+                    regime_info = (
+                        f"{ar.market_regime.regime} / "
+                        f"ボラ:{ar.market_regime.volatility_level} / "
+                        f"トレンド強度:{ar.market_regime.trend_strength}"
+                    )
+            except Exception:
+                pass
+
+            # Groq AIに変更の妥当性を確認
+            logger.info(f"[週次レビュー] Groq AIに判断を依頼中... ({rule_reason})")
+            review = self.groq_reviewer.review_weekly_performance(
+                trades=history,
+                current_threshold=current,
+                proposed_threshold=proposed,
+                market_regime=regime_info,
+            )
+
+            approved = review.get("approved", True)
+            final_thr = review.get("final_threshold", proposed)
+            ai_reason = review.get("reasoning", "")
+            warnings = review.get("warnings", [])
+
+            if approved:
+                self.config.confidence_threshold = final_thr
+                actual = self.config.confidence_threshold
+                logger.info(
+                    f"[週次レビュー] AI承認: {current}% → {actual}% | {ai_reason}"
+                )
+                change_label = f"{current}% → {actual}%"
+                status = "✅ 変更実行"
+            else:
+                actual = current
+                logger.info(
+                    f"[週次レビュー] AI却下: 閾値 {current}% 維持 | {ai_reason}"
+                )
+                change_label = f"{current}% 維持"
+                status = "🚫 変更見送り"
+
+            warn_text = "\n".join(f"⚠️ {w}" for w in warnings) if warnings else ""
+            msg = (
+                f"🤖 週次戦略レビュー\n"
+                f"直近{len(history)}トレード PF: {pf:.2f}\n"
+                f"ルール判断: {rule_reason}\n"
+                f"AI判断: {status}\n"
+                f"信頼度閾値: {change_label}\n"
+                f"AI理由: {ai_reason}"
+            )
+            if warn_text:
+                msg += f"\n{warn_text}"
+
+            self.notifier.send("週次戦略レビュー", msg)
+
+        except Exception as e:
+            logger.error(f"Weekly threshold review failed: {e}")
+
     def stop(self) -> None:
         """Stop the trading bot and disconnect."""
         self._running = False
@@ -321,20 +429,46 @@ class TradingBot:
             f"win_rate={adaptive.get('recent_win_rate', 'N/A')}"
         )
 
+        # ドローダウン警告通知（3%・5%・7%の閾値を超えたら1回だけ送信）
+        dd_pct = risk_summary["drawdown_pct"]
+        for dd_thr in (3.0, 5.0, 7.0):
+            if dd_pct >= dd_thr and dd_thr not in self._dd_warned_levels:
+                self._dd_warned_levels.add(dd_thr)
+                self.notifier.drawdown_warning(
+                    drawdown_pct=dd_pct,
+                    threshold_pct=dd_thr,
+                    balance=account.get("balance", 0),
+                )
+            elif dd_pct < dd_thr:
+                # 回復したらリセット（次回また警告できるように）
+                self._dd_warned_levels.discard(dd_thr)
+
         # Send daily summary when the date rolls over (triggers once per day)
         today = datetime.now().strftime("%Y-%m-%d")
         if self._last_summary_date and self._last_summary_date != today:
             self._send_daily_summary(self._last_summary_date)
         self._last_summary_date = today
 
-    def _update_market_regime(self) -> None:
-        """Run AI market regime analysis to update adaptive risk parameters."""
-        if not self.ai_analyzer:
-            return
+        # 週次閾値自動調整（毎週月曜に実行）
+        this_week = datetime.now().strftime("%Y-W%W")
+        if self._last_weekly_review_date != this_week and datetime.now().weekday() == 0:
+            self._weekly_threshold_review()
+            self._last_weekly_review_date = this_week
 
+    def _update_market_regime(self) -> None:
+        """Groq + 外部センチメントで相場レジームを判断し、リスク管理に反映する。
+
+        Geminiの画像ベース判断を廃止し、以下を組み合わせてGroqが判断:
+          - テクニカル指標（ATR / ADX / RSI / MA / BB幅）
+          - yfinanceニュース見出し
+          - ForexFactory 経済指標カレンダー
+          - Reddit r/Forex 投稿
+        """
+        import time as _time
         try:
-            # Use first active pair's primary data for regime analysis
             instrument = self.config.active_pairs[0]
+            pair_config = self.config.pair_configs.get(instrument, {})
+            pair_name = pair_config.get("name", instrument)
             resolution = self.config.timeframes.get("primary", "HOUR_4")
             df = self.data_manager.fetch_prices(instrument, resolution, num_points=200)
 
@@ -342,18 +476,61 @@ class TradingBot:
                 return
 
             df = self.tech_analyzer.add_all_indicators(df)
-            regime_data = self.ai_analyzer.analyze_market_regime(df, instrument)
+            last = df.iloc[-1]
 
-            # Update the adaptive controller's market regime
+            # テクニカル指標を辞書化
+            indicators = {
+                "atr": round(float(last.get("atr", 0)), 5),
+                "adx": round(float(last.get("adx", 0)), 1),
+                "rsi": round(float(last.get("rsi", 50)), 1),
+                "price": round(float(last.get("close", 0)), 5),
+                "ma20": round(float(last.get("sma_20", 0)), 5),
+                "ma200": round(float(last.get("sma_200", 0)), 5),
+                "bb_width": round(
+                    float(last.get("bb_upper", 0)) - float(last.get("bb_lower", 0)), 5
+                ),
+            }
+
+            # センチメントデータを1時間キャッシュ
+            now_ts = _time.time()
+            if now_ts - self._last_sentiment_ts > 3600:
+                self._last_sentiment = self.sentiment_fetcher.fetch_all(
+                    self.config.active_pairs
+                )
+                self._last_sentiment_ts = now_ts
+
+            # Groqで相場レジームを判断
+            regime_data = self.groq_reviewer.analyze_market_regime(
+                indicators=indicators,
+                sentiment_data=self._last_sentiment,
+                pair_name=pair_name,
+            )
+
+            new_regime = regime_data.get("regime", "ranging")
             from src.models.risk_manager import MarketRegime
             self.risk_manager.adaptive.market_regime = MarketRegime(
-                regime=regime_data.get("regime", "normal"),
+                regime=new_regime,
                 volatility_level=regime_data.get("volatility_level", "medium"),
                 trend_strength=regime_data.get("trend_strength", "moderate"),
-                risk_multiplier=regime_data.get("risk_multiplier", 0.8),
+                risk_multiplier=regime_data.get("risk_multiplier", 1.0),
                 confidence=regime_data.get("confidence", 50),
                 reasoning=regime_data.get("reasoning", ""),
             )
+
+            # レジーム変化通知 + 保有ポジションのSL/TP調整
+            if self._prev_regime and self._prev_regime != new_regime:
+                self.notifier.regime_changed(
+                    pair=pair_name,
+                    old_regime=self._prev_regime,
+                    new_regime=new_regime,
+                    volatility=regime_data.get("volatility_level", "medium"),
+                    trend=regime_data.get("trend_strength", "moderate"),
+                    risk_multiplier=regime_data.get("risk_multiplier", 1.0),
+                    reasoning=regime_data.get("reasoning", ""),
+                )
+                # 保有中ポジションのSL/TPをレジームに合わせて再計算
+                self._adjust_open_positions_for_regime(new_regime)
+            self._prev_regime = new_regime
 
         except Exception as e:
             logger.error(f"Market regime update failed: {e}")
@@ -426,9 +603,15 @@ class TradingBot:
             logger.info(f"No signals for {pair_name}")
             return
 
-        # 3. Take the best signal (with adaptive pattern filtering)
+        # 3. Take the best signal (with adaptive pattern filtering + confidence threshold)
+        thr = self.config.confidence_threshold
         best_signal = None
         for sig in signals:
+            if sig.confidence < thr:
+                logger.debug(
+                    f"Signal confidence {sig.confidence}% < threshold {thr}%: skip"
+                )
+                continue
             skip, skip_reason = self.risk_manager.adaptive.should_skip_pattern(
                 sig.pattern.value
             )
@@ -637,12 +820,35 @@ class TradingBot:
                     f"PnL=¥{pnl:+,.0f}"
                 )
 
+                # R:R 計算
+                entry_p = trade_info.get("entry_price", 0)
+                sl_p = trade_info.get("stop_loss", 0)
+                tp_p = trade_info.get("take_profit", 0)
+                rr = (
+                    abs(tp_p - entry_p) / abs(entry_p - sl_p)
+                    if entry_p and sl_p and abs(entry_p - sl_p) > 0
+                    else 0.0
+                )
+                # Pips 計算
+                if exit_price and entry_p:
+                    direction_str = trade_info.get("direction", "")
+                    pip_unit = 0.01 if "JPY" in instrument else 0.0001
+                    raw_diff = (exit_price - entry_p) if direction_str == "BUY" else (entry_p - exit_price)
+                    pips_val = raw_diff / pip_unit
+                else:
+                    pips_val = 0.0
+
                 # Notify
                 self.notifier.trade_closed(
                     pair=pair_name,
                     direction=trade_info.get("direction", ""),
                     pnl=pnl,
-                    pips=0,
+                    pips=pips_val,
+                    entry_price=entry_p,
+                    exit_price=exit_price,
+                    opened_at=trade_info.get("opened_at", ""),
+                    pattern=trade_info.get("pattern", ""),
+                    risk_reward=rr,
                 )
 
                 del self._open_trades[instrument]
@@ -701,6 +907,131 @@ class TradingBot:
             except Exception as e:
                 logger.error(f"Error monitoring {instrument}: {e}")
 
+    def fix_open_positions_sltp(self) -> None:
+        """保有中の全ポジションのSL/TPを修正済みロジックで即時再計算・更新する。
+
+        `python main.py --fix-sltp` から呼び出す。
+        レジーム変化を待たずに今すぐ適用したい場合に使用。
+        """
+        if not self._open_trades:
+            logger.info("[fix-sltp] 保有ポジションなし")
+            return
+
+        # 現在のレジームを最新状態に更新してから適用
+        self._update_market_regime()
+        current_regime = self.risk_manager.adaptive.market_regime.regime
+        logger.info(
+            f"[fix-sltp] 現在レジーム: {current_regime} | "
+            f"{len(self._open_trades)}件のポジションを修正します"
+        )
+        self._adjust_open_positions_for_regime(current_regime)
+
+    def _adjust_open_positions_for_regime(self, new_regime: str) -> None:
+        """レジーム変化時に保有ポジションのSL/TPをレジームに合わせて再計算・更新する。
+
+        SLは含み益を守る方向のみ移動（不利方向には動かさない）。
+        TPは新レジームの期待値に合わせて再設定する。
+
+        Args:
+            new_regime: Groqが判断した新しい相場レジーム名。
+        """
+        if not self._open_trades:
+            return
+
+        logger.info(
+            f"[Regime調整] レジーム変化({new_regime})により"
+            f"{len(self._open_trades)}件の保有ポジションを見直します"
+        )
+
+        for instrument, trade_info in self._open_trades.items():
+            try:
+                direction = trade_info.get("direction", "")
+                entry_price = trade_info.get("entry_price", 0.0)
+                current_sl = trade_info.get("stop_loss", 0.0)
+                deal_id = trade_info.get("deal_id", "")
+
+                if not entry_price or not deal_id:
+                    continue
+
+                # 現在のATRを取得
+                df = self.data_manager.fetch_prices(
+                    instrument,
+                    self.config.timeframes.get("primary", "HOUR_4"),
+                    num_points=20,
+                )
+                if df.empty:
+                    continue
+                if "atr" not in df.columns:
+                    df = self.tech_analyzer.add_atr(df)
+                atr = float(df["atr"].iloc[-1]) if "atr" in df.columns else 0
+                if atr == 0:
+                    continue
+
+                # pip_size を価格から推定（JPY系=0.01、それ以外=0.0001）
+                pip_size = 0.01 if entry_price > 50 else 0.0001
+
+                # レジーム調整済みSL/TPを計算（min/max pip bounds 適用済み）
+                new_sl = self.risk_manager.calculate_stop_loss(
+                    direction=direction,
+                    entry_price=entry_price,
+                    atr=atr,
+                    pip_size=pip_size,
+                )
+                new_tp = self.risk_manager.calculate_take_profit(
+                    direction=direction,
+                    entry_price=entry_price,
+                    stop_loss=new_sl,
+                )
+
+                # SLは含み益を守る方向のみ移動（不利方向には動かさない）
+                sl_improved = (
+                    (direction == "BUY"  and new_sl > current_sl) or
+                    (direction == "SELL" and new_sl < current_sl)
+                )
+                sl_to_apply = new_sl if sl_improved else current_sl
+
+                # ブローカーに反映
+                self.broker.update_position(
+                    deal_id=deal_id,
+                    stop_level=sl_to_apply,
+                    limit_level=new_tp,
+                )
+
+                # SQLiteに反映
+                self.position_store.update_position(
+                    deal_id=deal_id,
+                    stop_loss=sl_to_apply,
+                    take_profit=new_tp,
+                )
+
+                pair_name = instrument.replace("_", "/")
+                decimals = 3 if "JPY" in instrument else 5
+
+                logger.info(
+                    f"[Regime調整] {pair_name} {direction} | "
+                    f"SL: {current_sl:.{decimals}f} → {sl_to_apply:.{decimals}f} | "
+                    f"TP: {trade_info.get('take_profit', 0):.{decimals}f} → {new_tp:.{decimals}f}"
+                )
+
+                # trade_info を更新
+                trade_info["stop_loss"] = sl_to_apply
+                trade_info["take_profit"] = new_tp
+
+                # SL変化があればLINE通知
+                if sl_to_apply != current_sl:
+                    self.notifier.sl_updated(
+                        pair=pair_name,
+                        direction=direction,
+                        old_sl=current_sl,
+                        new_sl=sl_to_apply,
+                        entry=entry_price,
+                    )
+
+            except Exception as e:
+                logger.error(
+                    f"[Regime調整] {instrument} の調整に失敗: {e}"
+                )
+
     def _estimate_closed_pnl(self, trade_info: dict[str, Any]) -> float:
         """Estimate P&L for a closed position.
 
@@ -743,6 +1074,7 @@ class TradingBot:
         instrument: str,
         resolution: str = "HOUR_4",
         external_df: pd.DataFrame | None = None,
+        confidence_threshold: int = 50,
     ) -> dict:
         """Run a backtest for a specific pair.
 
@@ -786,7 +1118,7 @@ class TradingBot:
             window = df.iloc[i - window_size:i + 1]
             patterns = self.pattern_detector.detect_all_patterns(window)
             for p in patterns:
-                if not p.is_valid or p.confidence < 50:
+                if not p.is_valid or p.confidence < confidence_threshold:
                     continue
                 key = f"{p.pattern.value}_{p.direction.value}"
                 last_bar = last_signal_bar.get(key, -MIN_SIGNAL_GAP - 1)
