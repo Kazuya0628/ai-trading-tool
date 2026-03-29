@@ -27,6 +27,7 @@ class TestRiskManager:
             "max_daily_trades": 10,
             "max_weekly_loss_pct": 5.0,
             "max_drawdown_pct": 10.0,
+            "phase": 3,  # Phase 3: all adaptive factors active
         })
 
     def _make_signal(
@@ -114,8 +115,8 @@ class TestRiskManager:
         assert "trade limit" in reason
 
     def test_max_open_positions(self) -> None:
-        """Test max open positions limit."""
-        self.rm.update_open_positions(3)
+        """Test max open positions limit (dynamic: 8 at full health)."""
+        self.rm.update_open_positions(8)
         can, reason = self.rm.can_trade(1_000_000)
         assert not can
         assert "Max open positions" in reason

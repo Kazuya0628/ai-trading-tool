@@ -57,6 +57,17 @@ def load_env() -> dict[str, str]:
         # Notifications
         "DISCORD_WEBHOOK_URL": os.getenv("DISCORD_WEBHOOK_URL", ""),
         "LINE_NOTIFY_TOKEN": os.getenv("LINE_NOTIFY_TOKEN", ""),
+        # LINE Messaging API
+        "LINE_CHANNEL_ACCESS_TOKEN": os.getenv("LINE_CHANNEL_ACCESS_TOKEN", ""),
+        "LINE_USER_ID": os.getenv("LINE_USER_ID", ""),
+        "IMGBB_API_KEY": os.getenv("IMGBB_API_KEY", ""),
+        # Email (SMTP)
+        "SMTP_HOST": os.getenv("SMTP_HOST", ""),
+        "SMTP_PORT": os.getenv("SMTP_PORT", "587"),
+        "SMTP_USER": os.getenv("SMTP_USER", ""),
+        "SMTP_PASSWORD": os.getenv("SMTP_PASSWORD", ""),
+        "EMAIL_FROM": os.getenv("EMAIL_FROM", ""),
+        "EMAIL_TO": os.getenv("EMAIL_TO", ""),
     }
 
     # Validate critical keys based on data source
@@ -89,6 +100,7 @@ def create_broker(env: dict[str, str]) -> Any:
             api_token=env["OANDA_API_TOKEN"],
             account_id=env["OANDA_ACCOUNT_ID"],
             environment=env.get("OANDA_ENVIRONMENT", "practice"),
+            trading_mode=env.get("TRADING_MODE", "paper"),
         )
     else:
         from src.brokers.twelvedata_client import TwelveDataClient

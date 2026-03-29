@@ -10,6 +10,10 @@ __pycache__/
 data/raw/
 data/processed/
 data/charts/
+data/gemini_audit/
+data/historical/
+data/positions.db
+data/ai_analysis_log.json
 
 # Logs
 logs/

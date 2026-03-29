@@ -397,3 +397,143 @@ class GroqReviewer:
             "confidence": 50,
             "reasoning": "Groq未使用のためデフォルト値",
         }
+
+    # ──────────────────────────────────────────────────
+    # 方向性投票（コンセンサスエンジン用）
+    # ──────────────────────────────────────────────────
+
+    def get_directional_vote(
+        self,
+        pair_name: str,
+        indicators: dict[str, Any],
+        sentiment_data: dict[str, Any],
+        current_regime: str = "",
+    ) -> dict[str, Any]:
+        """ニュース・経済指標・指標から方向性を投票する。（Layer 3コンセンサス用）
+
+        Args:
+            pair_name: "USD/JPY" など。
+            indicators: ATR / ADX / RSI / price / MA 辞書。
+            sentiment_data: SentimentFetcher.fetch_all() の返り値。
+            current_regime: Groqが直前に判断したレジーム文字列。
+
+        Returns:
+            {
+              "direction": SignalDirection,   # BUY / SELL / NONE
+              "confidence": float,            # 0-100
+              "reasoning": str,
+            }
+        """
+        from src.strategies.pattern_detector import SignalDirection as SD
+        _neutral = {"direction": SD.NONE, "confidence": 50.0, "reasoning": "Groq未使用"}
+
+        if not self.available:
+            return _neutral
+
+        try:
+            prompt = self._build_direction_prompt(
+                pair_name, indicators, sentiment_data, current_regime
+            )
+            response = self._client.chat.completions.create(
+                model=self.MODEL,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "あなたはFXトレードシステムのAIアナリストです。"
+                            "テクニカル指標・ニュース・経済指標をもとに今後の方向性を判断し、"
+                            "必ずJSON形式のみで回答してください。"
+                        ),
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+                max_tokens=256,
+                temperature=0.1,
+            )
+            raw = response.choices[0].message.content.strip()
+            result = self._parse_direction_response(raw)
+            logger.info(
+                f"[Groq Vote] {pair_name}: {result['direction'].value} "
+                f"conf={result['confidence']:.0f}% reason={result['reasoning'][:50]}"
+            )
+            return result
+
+        except Exception as e:
+            logger.error(f"[Groq] 方向性投票失敗: {e}")
+            return _neutral
+
+    def _build_direction_prompt(
+        self,
+        pair_name: str,
+        indicators: dict[str, Any],
+        sentiment_data: dict[str, Any],
+        regime: str,
+    ) -> str:
+        rsi = indicators.get("rsi", "N/A")
+        adx = indicators.get("adx", "N/A")
+        price = indicators.get("price", "N/A")
+        ma20 = indicators.get("ma20", "N/A")
+        ma200 = indicators.get("ma200", "N/A")
+
+        cal = sentiment_data.get("economic_calendar", [])
+        cal_text = "\n".join(
+            f"  - {e['date']} [{e['currency']}] {e['event']}"
+            f"(予測:{e.get('forecast','?')} 前回:{e.get('previous','?')})"
+            for e in cal[:4]
+        ) or "  なし"
+
+        news_items: list = []
+        for arts in (sentiment_data.get("fx_news") or {}).values():
+            news_items.extend(arts)
+        news_items.sort(key=lambda a: a.get("age_hours", 99))
+        news_text = "\n".join(
+            f"  - [{a['age_hours']}h前] {a['title']}"
+            for a in news_items[:4]
+        ) or "  なし"
+
+        return f"""
+## {pair_name} の方向性判断
+
+### テクニカル指標
+- RSI: {rsi} | ADX: {adx}
+- 価格: {price} (MA20: {ma20} / MA200: {ma200})
+- 現在レジーム: {regime}
+
+### 直近FXニュース
+{news_text}
+
+### 今後の経済指標
+{cal_text}
+
+### 判断
+今後の{pair_name}の方向性をJSON形式のみで回答してください:
+{{
+  "direction": "BUY" または "SELL" または "NEUTRAL",
+  "confidence": 0〜100,
+  "reasoning": "理由を60字以内で"
+}}
+"""
+
+    def _parse_direction_response(self, raw: str) -> dict[str, Any]:
+        import json as _json
+        import re
+        from src.strategies.pattern_detector import SignalDirection as SD
+
+        match = re.search(r"\{.*\}", raw, re.DOTALL)
+        if not match:
+            return {"direction": SD.NONE, "confidence": 50.0, "reasoning": "パース失敗"}
+        try:
+            data = _json.loads(match.group())
+            dir_str = data.get("direction", "NEUTRAL").upper()
+            direction = (
+                SD.BUY if dir_str == "BUY"
+                else SD.SELL if dir_str == "SELL"
+                else SD.NONE
+            )
+            return {
+                "direction": direction,
+                "confidence": float(data.get("confidence", 50)),
+                "reasoning": str(data.get("reasoning", "")),
+            }
+        except (ValueError, KeyError):
+            return {"direction": SD.NONE, "confidence": 50.0, "reasoning": "パース失敗"}

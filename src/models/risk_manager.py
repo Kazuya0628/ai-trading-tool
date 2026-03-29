@@ -20,6 +20,7 @@ import numpy as np
 import pandas as pd
 from loguru import logger
 
+from src.domain.enums import Phase
 from src.strategies.pattern_detector import SignalDirection
 from src.strategies.strategy_engine import TradeSignal
 
@@ -180,26 +181,43 @@ class AdaptiveRiskController:
         # Pattern disable threshold
         self._pattern_disable_wr = self.config.get("pattern_disable_win_rate", 0.25)
 
-    def calculate_risk_multiplier(self, current_drawdown_pct: float) -> float:
-        """Calculate overall risk multiplier based on all adaptive factors.
+        # Dynamic position limit settings (design doc: 6/5/4/3)
+        self._base_max_positions = self.config.get("base_max_positions", 6)
+        self._position_limit_tiers = self.config.get("position_limit_tiers", [
+            {"multiplier_min": 0.8, "positions": 6},   # 好調: 最大6
+            {"multiplier_min": 0.5, "positions": 5},   # 通常: 5
+            {"multiplier_min": 0.3, "positions": 4},   # やや不調: 4
+            {"multiplier_min": 0.0, "positions": 3},   # 不調: 最低保証3
+        ])
+
+    def calculate_risk_multiplier(
+        self, current_drawdown_pct: float, phase: Phase = Phase.PHASE_3,
+    ) -> float:
+        """Calculate overall risk multiplier based on adaptive factors and phase.
+
+        Phase-based activation:
+        - Phase 1: Fixed 0.5% risk, return 1.0 (shadow calc for logging)
+        - Phase 2: Loss streak + DD factors active
+        - Phase 3: All factors active (regime, performance)
 
         Args:
             current_drawdown_pct: Current drawdown percentage.
+            phase: Current operational phase.
 
         Returns:
             Risk multiplier (0.0-1.0) to apply to base position size.
         """
-        # Factor 1: Consecutive loss scaling
-        loss_scale = self._consecutive_loss_scale()
+        # Factor 1: Consecutive loss scaling (Phase 2+)
+        loss_scale = self._consecutive_loss_scale() if phase.value >= 2 else 1.0
 
-        # Factor 2: Drawdown-based scaling
-        dd_scale = self._drawdown_scale(current_drawdown_pct)
+        # Factor 2: Drawdown-based scaling (Phase 2+)
+        dd_scale = self._drawdown_scale(current_drawdown_pct) if phase.value >= 2 else 1.0
 
-        # Factor 3: Market regime (from AI)
-        regime_scale = self.market_regime.risk_multiplier
+        # Factor 3: Market regime (Phase 3 only)
+        regime_scale = self.market_regime.risk_multiplier if phase.value >= 3 else 1.0
 
-        # Factor 4: Recent win rate momentum
-        wr_scale = self._win_rate_scale()
+        # Factor 4: Recent win rate momentum (Phase 3 only)
+        wr_scale = self._win_rate_scale() if phase.value >= 3 else 1.0
 
         # Combined multiplier (multiplicative — all factors stack)
         combined = loss_scale * dd_scale * regime_scale * wr_scale
@@ -207,7 +225,8 @@ class AdaptiveRiskController:
         combined = min(combined, 1.0)  # Never exceed base risk
 
         logger.info(
-            f"Adaptive risk: loss={loss_scale:.2f} × dd={dd_scale:.2f} × "
+            f"Adaptive risk (Phase {phase.value}): "
+            f"loss={loss_scale:.2f} × dd={dd_scale:.2f} × "
             f"regime={regime_scale:.2f} × wr={wr_scale:.2f} = {combined:.2f}"
         )
 
@@ -272,6 +291,36 @@ class AdaptiveRiskController:
             return 0.65  # Underperforming
         else:
             return 0.50  # Poor performance, halve risk
+
+    def dynamic_max_positions(
+        self, current_drawdown_pct: float, phase: Phase = Phase.PHASE_3,
+    ) -> int:
+        """Calculate dynamic max open positions based on current risk state.
+
+        Uses the same risk multiplier that drives position sizing.
+        When conditions are favorable (high multiplier), allows more
+        positions to capture opportunities. When unfavorable, reduces
+        exposure by lowering the limit.
+
+        Args:
+            current_drawdown_pct: Current drawdown percentage.
+            phase: Current operational phase.
+
+        Returns:
+            Adjusted max open position count.
+        """
+        multiplier = self.calculate_risk_multiplier(current_drawdown_pct, phase=phase)
+
+        for tier in self._position_limit_tiers:
+            if multiplier >= tier["multiplier_min"]:
+                limit = tier["positions"]
+                logger.info(
+                    f"Dynamic position limit: multiplier={multiplier:.2f} "
+                    f"-> max_positions={limit}"
+                )
+                return limit
+
+        return self._position_limit_tiers[-1]["positions"]
 
     def get_summary(self) -> dict[str, Any]:
         """Get adaptive risk state summary.
@@ -342,6 +391,12 @@ class RiskManager:
         self.max_drawdown_pct = self.config.get("max_drawdown_pct", 10.0)
         self.drawdown_cooldown_hrs = self.config.get("drawdown_cooldown_hours", 24)
 
+        # Phase-based operation
+        self.phase = Phase(self.config.get("phase", 1))
+
+        # Phase 1 fixed risk override
+        self._phase1_fixed_risk_pct = self.config.get("phase1_fixed_risk_pct", 0.5)
+
         # Adaptive risk controller
         self.adaptive = AdaptiveRiskController(
             self.config.get("adaptive", {})
@@ -403,9 +458,15 @@ class RiskManager:
             reason = f"Daily trade limit reached: {self.state.daily_trade_count}"
             return False, reason
 
-        # Check max open positions
-        if self.state.open_position_count >= self.max_open_positions:
-            reason = f"Max open positions: {self.state.open_position_count}"
+        # Check max open positions (dynamic limit based on adaptive risk)
+        dynamic_limit = self.adaptive.dynamic_max_positions(
+            self.state.current_drawdown_pct
+        )
+        if self.state.open_position_count >= dynamic_limit:
+            reason = (
+                f"Max open positions: {self.state.open_position_count}"
+                f" (dynamic limit: {dynamic_limit})"
+            )
             return False, reason
 
         self.state.is_trading_allowed = True
@@ -475,11 +536,36 @@ class RiskManager:
         Returns:
             PositionSize with calculated lots.
         """
-        # Apply adaptive risk multiplier
-        adaptive_mult = self.adaptive.calculate_risk_multiplier(
-            self.state.current_drawdown_pct
-        )
-        adjusted_risk_pct = self.risk_per_trade_pct * adaptive_mult
+        # Phase 1: fixed risk, adaptive runs as shadow
+        if self.phase == Phase.PHASE_1:
+            adaptive_mult = self.adaptive.calculate_risk_multiplier(
+                self.state.current_drawdown_pct, phase=self.phase,
+            )
+            # Shadow log only — actual risk is fixed
+            shadow_risk = self.risk_per_trade_pct * adaptive_mult
+            logger.debug(
+                f"[Phase1 Shadow] adaptive_mult={adaptive_mult:.2f} "
+                f"→ shadow_risk={shadow_risk:.3f}% (actual={self._phase1_fixed_risk_pct}%)"
+            )
+            adjusted_risk_pct = self._phase1_fixed_risk_pct
+        else:
+            # Phase 2+: adaptive risk is live
+            adaptive_mult = self.adaptive.calculate_risk_multiplier(
+                self.state.current_drawdown_pct, phase=self.phase,
+            )
+            # Apply signal quality multiplier (AI consensus-based dynamic sizing)
+            quality_mult = self._signal_quality_multiplier(signal)
+            adjusted_risk_pct = self.risk_per_trade_pct * adaptive_mult * quality_mult
+
+        quality_mult = self._signal_quality_multiplier(signal) if self.phase != Phase.PHASE_1 else 1.0
+        if quality_mult != 1.0:
+            logger.info(
+                f"[DynamicSize] Signal quality ×{quality_mult:.2f} "
+                f"(consensus={getattr(signal, 'consensus_confirmed', False)}, "
+                f"ai={getattr(signal, 'ai_confirmed', False)}, "
+                f"conf={signal.confidence:.0f}%) "
+                f"→ risk={adjusted_risk_pct:.3f}%"
+            )
 
         # Calculate risk amount
         risk_amount = account_balance * adjusted_risk_pct / 100
@@ -513,6 +599,37 @@ class RiskManager:
             account_balance=account_balance,
             risk_pct=adjusted_risk_pct,
         )
+
+    @staticmethod
+    def _signal_quality_multiplier(signal: TradeSignal) -> float:
+        """Determine position size multiplier based on AI consensus quality.
+
+        Tiers:
+          Tier 1 — Consensus confirmed (2/3 AI agree) + conf ≥ 85% → ×1.5 (max risk)
+          Tier 2 — AI confirmed (Gemini agrees) + conf ≥ 75%        → ×1.2
+          Tier 3 — Normal algo signal, conf ≥ 65%                   → ×1.0 (base)
+          Tier 4 — Weak signal, conf < 65%                          → ×0.7
+
+        The multiplier is applied ON TOP OF the adaptive multiplier, so the
+        effective risk range is approximately 0.7% – 1.5% of account balance.
+
+        Args:
+            signal: TradeSignal with confidence and confirmation flags.
+
+        Returns:
+            Float multiplier in range [0.7, 1.5].
+        """
+        consensus_confirmed = getattr(signal, "consensus_confirmed", False)
+        ai_confirmed = getattr(signal, "ai_confirmed", False)
+        conf = signal.confidence
+
+        if consensus_confirmed and conf >= 85:
+            return 1.5   # Tier 1: 全AI合意・高信頼度 → フルサイズ×1.5
+        if ai_confirmed and conf >= 75:
+            return 1.2   # Tier 2: Gemini確認済み → やや増量
+        if conf >= 65:
+            return 1.0   # Tier 3: 標準シグナル → ベース維持
+        return 0.7        # Tier 4: 低信頼度 → 縮小
 
     @property
     def regime_sl_atr_multiple(self) -> float:

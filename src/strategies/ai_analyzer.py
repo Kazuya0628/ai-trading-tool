@@ -134,6 +134,79 @@ class AIChartAnalyzer:
                             )
                         )
 
+                # --- Sub-plot indicators (RSI, ADX, MACD) ---
+                # RSI panel (panel=2)
+                if "rsi" in df.columns:
+                    rsi_data = df["rsi"].copy()
+                    chart_df["rsi"] = rsi_data.values
+                    addplots.append(
+                        mpf.make_addplot(
+                            chart_df["rsi"], panel=2, color="cyan",
+                            ylabel="RSI", width=0.8,
+                        )
+                    )
+                    # Overbought / Oversold lines
+                    chart_df["rsi_70"] = 70.0
+                    chart_df["rsi_30"] = 30.0
+                    addplots.append(
+                        mpf.make_addplot(
+                            chart_df["rsi_70"], panel=2, color="red",
+                            linestyle="--", width=0.4,
+                        )
+                    )
+                    addplots.append(
+                        mpf.make_addplot(
+                            chart_df["rsi_30"], panel=2, color="green",
+                            linestyle="--", width=0.4,
+                        )
+                    )
+
+                # ADX panel (panel=3)
+                if "adx" in df.columns:
+                    chart_df["adx"] = df["adx"].values
+                    addplots.append(
+                        mpf.make_addplot(
+                            chart_df["adx"], panel=3, color="yellow",
+                            ylabel="ADX", width=0.8,
+                        )
+                    )
+                    chart_df["adx_25"] = 25.0
+                    addplots.append(
+                        mpf.make_addplot(
+                            chart_df["adx_25"], panel=3, color="gray",
+                            linestyle="--", width=0.4,
+                        )
+                    )
+
+                # MACD panel (panel=4)
+                if "macd" in df.columns and "macd_signal" in df.columns:
+                    chart_df["macd"] = df["macd"].values
+                    chart_df["macd_signal"] = df["macd_signal"].values
+                    addplots.append(
+                        mpf.make_addplot(
+                            chart_df["macd"], panel=4, color="lime",
+                            ylabel="MACD", width=0.7,
+                        )
+                    )
+                    addplots.append(
+                        mpf.make_addplot(
+                            chart_df["macd_signal"], panel=4, color="red",
+                            width=0.7,
+                        )
+                    )
+                    if "macd_hist" in df.columns:
+                        chart_df["macd_hist"] = df["macd_hist"].values
+                        colors = [
+                            "#26a69a" if v >= 0 else "#ef5350"
+                            for v in chart_df["macd_hist"]
+                        ]
+                        addplots.append(
+                            mpf.make_addplot(
+                                chart_df["macd_hist"], panel=4,
+                                type="bar", color=colors, width=0.5,
+                            )
+                        )
+
             # Chart settings
             width = self.config.get("chart_width", 1200)
             height = self.config.get("chart_height", 800)
@@ -171,6 +244,7 @@ class AIChartAnalyzer:
         df: pd.DataFrame | None = None,
         pair_name: str = "",
         timeframe: str = "",
+        context_data: dict | None = None,
     ) -> PatternSignal:
         """Analyze chart image using Gemini AI.
 
@@ -205,8 +279,11 @@ class AIChartAnalyzer:
             # Convert bytes to PIL Image
             image = Image.open(io.BytesIO(image_bytes))
 
-            # Get prompt
-            prompt = self.config.get("prompt_template", self._default_prompt())
+            # Get prompt (optionally enriched with news/economic context)
+            prompt = self.config.get(
+                "prompt_template",
+                self._default_prompt(context_data=context_data),
+            )
 
             # Save chart image for audit trail
             self._save_audit_chart(image_bytes, pair_name, timeframe, "analysis")
@@ -307,6 +384,20 @@ class AIChartAnalyzer:
                 stop_loss = resistance if resistance > 0 else current_price * 1.01
                 take_profit = support if support > 0 else current_price * 0.98
 
+            # Extract trend assessment from Gemini response
+            trend_data = data.get("trend", {}) or {}
+            trend_current = trend_data.get("current", "SIDEWAYS").upper()
+            trend_reversal = bool(trend_data.get("reversal", False))
+            trend_strength = trend_data.get("strength", "moderate").lower()
+            trend_evidence = trend_data.get("evidence", "")
+
+            if trend_current or trend_reversal:
+                logger.info(
+                    f"[Gemini] Trend: current={trend_current} "
+                    f"reversal={trend_reversal} strength={trend_strength} "
+                    f"evidence={trend_evidence[:80]}"
+                )
+
             return PatternSignal(
                 pattern=pattern,
                 direction=direction,
@@ -318,7 +409,14 @@ class AIChartAnalyzer:
                 support=support,
                 resistance=resistance,
                 reasoning=data.get("reasoning", "AI visual analysis"),
-                extra={"ai_source": "gemini", "raw_response": data},
+                extra={
+                    "ai_source": "gemini",
+                    "raw_response": data,
+                    "trend_current": trend_current,
+                    "trend_reversal": trend_reversal,
+                    "trend_strength": trend_strength,
+                    "trend_evidence": trend_evidence,
+                },
             )
 
         except (json.JSONDecodeError, KeyError, ValueError) as e:
@@ -327,9 +425,48 @@ class AIChartAnalyzer:
             return PatternSignal(PatternType.NO_SIGNAL, SignalDirection.NONE, 0)
 
     @staticmethod
-    def _default_prompt() -> str:
-        """Default analysis prompt if not configured."""
-        return """Analyze this FX chart image. Identify if any of these patterns are present:
+    def _default_prompt(context_data: dict | None = None) -> str:
+        """Default analysis prompt, optionally enriched with news/economic context."""
+        # Build macro context section if data provided
+        macro_section = ""
+        if context_data:
+            news_items: list = []
+            for arts in (context_data.get("fx_news") or {}).values():
+                news_items.extend(arts)
+            news_items.sort(key=lambda a: a.get("age_hours", 99))
+            news_lines = "\n".join(
+                f"  - [{a['age_hours']}h ago] {a['title']}"
+                for a in news_items[:4]
+            ) or "  None"
+
+            cal = context_data.get("economic_calendar") or []
+            cal_lines = "\n".join(
+                f"  - {e['date']} [{e['currency']}] {e['event']} "
+                f"(forecast:{e.get('forecast','?')} prev:{e.get('previous','?')})"
+                for e in cal[:4]
+            ) or "  None"
+
+            macro_section = f"""
+MACRO CONTEXT (use this to strengthen or weaken your conviction):
+Recent FX News:
+{news_lines}
+
+Upcoming Economic Events (next 3 days):
+{cal_lines}
+
+"""
+
+        return f"""Analyze this FX chart image and answer TWO questions:
+{macro_section}
+QUESTION 1 - TREND ANALYSIS:
+What is the current trend, and is it showing signs of reversal?
+- Current trend direction (BULLISH / BEARISH / SIDEWAYS)
+- Reversal signal present? (true / false)
+- Reversal strength (weak / moderate / strong)
+- Evidence: MA alignment, price structure (higher highs/lows or lower highs/lows), momentum
+
+QUESTION 2 - PATTERN DETECTION:
+Identify if any of these reversal/continuation patterns are present:
 1. Double Bottom (W-shape) - especially "right-side up" variant with higher second low
 2. Double Top (M-shape)
 3. Inverse Head and Shoulders - especially "right shoulder up" variant
@@ -337,15 +474,23 @@ class AIChartAnalyzer:
 5. Channel Breakout
 6. Moving Average Crossover signals
 
+If macro context is provided, factor in upcoming high-impact events that could affect direction.
+
 Return ONLY a JSON object:
-{
+{{
   "signal": 1 or 0,
   "direction": "BUY" or "SELL" or "NONE",
   "pattern": "pattern_name",
   "confidence": 0-100,
-  "key_levels": {"support": price, "resistance": price, "neckline": price},
-  "reasoning": "brief explanation"
-}"""
+  "trend": {{
+    "current": "BULLISH" or "BEARISH" or "SIDEWAYS",
+    "reversal": true or false,
+    "strength": "weak" or "moderate" or "strong",
+    "evidence": "brief description of MA alignment and price structure"
+  }},
+  "key_levels": {{"support": price, "resistance": price, "neckline": price}},
+  "reasoning": "brief explanation combining trend, pattern, and macro context"
+}}"""
 
     def analyze_market_regime(
         self,
@@ -608,6 +753,133 @@ Risk multiplier guidelines:
             logger.debug(f"[Gemini] Chart saved: {filepath}")
         except Exception as e:
             logger.debug(f"Audit chart save failed (non-critical): {e}")
+
+    def evaluate_position(
+        self,
+        df: pd.DataFrame,
+        pair_name: str,
+        timeframe: str,
+        position_direction: str,
+        entry_price: float,
+        current_price: float,
+    ) -> dict[str, Any]:
+        """Re-evaluate an open position: HOLD or CLOSE?  (Layer 2)
+
+        Args:
+            df: OHLCV DataFrame with indicators.
+            pair_name: Currency pair name.
+            timeframe: Chart timeframe string.
+            position_direction: "BUY" or "SELL".
+            entry_price: Original entry price.
+            current_price: Current market price.
+
+        Returns:
+            {
+              "action": "HOLD" | "CLOSE",
+              "direction": SignalDirection,   # opposite = close signal
+              "confidence": float,
+              "reasoning": str,
+            }
+        """
+        from src.strategies.pattern_detector import SignalDirection as SD
+        _hold = {"action": "HOLD", "direction": SD.NONE, "confidence": 50.0, "reasoning": ""}
+
+        if not self._model:
+            return _hold
+
+        cache_key = self._make_cache_key(
+            f"eval_{position_direction}", pair_name, timeframe, df
+        )
+        cached = self._get_cache(cache_key)
+        if cached is not None:
+            logger.info(f"[Gemini Eval] Cache hit: {pair_name} position evaluation")
+            return cached
+
+        try:
+            image_bytes = self.generate_chart_image(df, pair_name, timeframe)
+            if image_bytes is None:
+                return _hold
+
+            pnl_pct = (current_price - entry_price) / entry_price * 100
+            if position_direction == "SELL":
+                pnl_pct = -pnl_pct
+
+            image = Image.open(io.BytesIO(image_bytes))
+            prompt = f"""You are reviewing an OPEN FX POSITION.
+
+POSITION:
+- Pair: {pair_name}
+- Direction: {position_direction}
+- Entry: {entry_price:.5f}
+- Current price: {current_price:.5f}
+- Unrealized P&L: {pnl_pct:+.2f}%
+
+QUESTION: Based on the current chart, should this position be HELD or CLOSED?
+
+Criteria for CLOSE recommendation:
+1. The original trade pattern has clearly failed or invalidated
+2. Strong reversal signals have formed against the position
+3. Price structure has fundamentally changed
+
+Only recommend CLOSE if confidence >= 80 with clear reversal evidence.
+When uncertain, choose HOLD.
+
+Return ONLY a JSON object:
+{{
+  "action": "HOLD" or "CLOSE",
+  "confidence": 0-100,
+  "direction": "BUY" or "SELL" (direction of the reversal signal if CLOSE, else same as position),
+  "reasoning": "max 100 chars"
+}}"""
+
+            response = self._model.generate_content([prompt, image])
+            if not (response and response.text):
+                return _hold
+
+            result = self._parse_eval_response(response.text, position_direction)
+            logger.info(
+                f"[Gemini Eval] {pair_name} {position_direction}: "
+                f"action={result['action']} conf={result['confidence']:.0f}% "
+                f"reason={result['reasoning'][:60]}"
+            )
+            self._set_cache(cache_key, result)
+            return result
+
+        except Exception as e:
+            logger.error(f"[Gemini] evaluate_position failed: {e}")
+            return _hold
+
+    def _parse_eval_response(self, text: str, position_direction: str) -> dict[str, Any]:
+        """Parse Gemini position evaluation response."""
+        from src.strategies.pattern_detector import SignalDirection as SD
+        try:
+            json_str = text
+            if "```json" in text:
+                json_str = text.split("```json")[1].split("```")[0]
+            elif "```" in text:
+                json_str = text.split("```")[1].split("```")[0]
+            elif "{" in text:
+                json_str = text[text.index("{"):text.rindex("}") + 1]
+
+            data = json.loads(json_str.strip())
+            action = data.get("action", "HOLD").upper()
+            confidence = float(data.get("confidence", 50))
+            dir_str = data.get("direction", position_direction).upper()
+            direction = (
+                SD.BUY if dir_str == "BUY"
+                else SD.SELL if dir_str == "SELL"
+                else SD.NONE
+            )
+            return {
+                "action": action,
+                "direction": direction,
+                "confidence": confidence,
+                "reasoning": str(data.get("reasoning", "")),
+            }
+        except (json.JSONDecodeError, KeyError, ValueError) as e:
+            logger.warning(f"[Gemini Eval] Parse failed: {e}")
+            from src.strategies.pattern_detector import SignalDirection as SD
+            return {"action": "HOLD", "direction": SD.NONE, "confidence": 50.0, "reasoning": ""}
 
     def save_chart(self, image_bytes: bytes, filename: str, output_dir: str = "data/charts") -> str:
         """Save chart image to file.

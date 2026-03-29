@@ -86,6 +86,14 @@ Examples:
         "--fix-sltp", action="store_true",
         help="Recalculate and update SL/TP for all open positions immediately",
     )
+    parser.add_argument(
+        "--notify-analysis", action="store_true",
+        help="Run analysis for all active pairs and send Gemini results to LINE immediately",
+    )
+    parser.add_argument(
+        "--trade-once", action="store_true",
+        help="Run one trading cycle immediately (analyze + execute trades if signals found)",
+    )
 
     args = parser.parse_args()
 
@@ -98,12 +106,16 @@ Examples:
     # Execute mode
     if args.status:
         _show_status(bot)
+    elif args.notify_analysis:
+        bot.run_analysis_notify()
     elif args.backtest:
         _run_backtest(bot, instrument, args.resolution, args.csv, args.download, args.years)
     elif args.analyze:
         _analyze_pair(bot, args.analyze)
     elif args.fix_sltp:
         _fix_sltp(bot)
+    elif args.trade_once:
+        bot.run_trade_once()
     else:
         # Start trading bot (paper mode)
         bot.start()
@@ -155,6 +167,8 @@ def _run_backtest(
     else:
         instruments = bot.config.active_pairs
 
+    results: list[tuple[str, dict]] = []
+
     for inst in instruments:
         # Determine data source
         external_df = None
@@ -168,19 +182,38 @@ def _run_backtest(
             external_df = load_or_download(inst, interval=resolution.lower().replace("hour_", "") + "h" if "HOUR" in resolution else "1d", years=years)
 
         if external_df is not None and not external_df.empty:
-            print(f"\n{'='*50}")
-            print(f"  Backtest: {inst} ({resolution}) — {len(external_df)} candles")
-            print(f"  Period: {external_df.index[0].strftime('%Y-%m-%d')} → {external_df.index[-1].strftime('%Y-%m-%d')}")
-            print(f"{'='*50}")
             result = bot.run_backtest(inst, resolution, external_df=external_df)
         else:
-            print(f"\n{'='*50}")
-            print(f"  Backtest: {inst} ({resolution})")
-            print(f"{'='*50}")
             result = bot.run_backtest(inst, resolution)
 
         if result:
-            print(json.dumps(result, indent=2))
+            results.append((inst, result))
+
+    # Print summary table if multiple pairs
+    if len(results) > 1:
+        print()
+        print("=" * 80)
+        print("  全ペア サマリー（適応制御）")
+        print("=" * 80)
+        print(f"  {'ペア':<10s} {'トレード':>6s} {'勝率':>7s} {'PF':>6s} {'損益':>14s} {'リターン':>8s} {'最大DD':>7s} {'SR':>6s}")
+        print(f"  {'-'*10} {'-'*6} {'-'*7} {'-'*6} {'-'*14} {'-'*8} {'-'*7} {'-'*6}")
+        total_pnl = 0.0
+        for inst, r in results:
+            pnl = float(r.get("total_pnl", "0").replace(",", ""))
+            wr = r.get("win_rate", "0%")
+            pf = r.get("profit_factor", "0")
+            dd = r.get("max_drawdown_pct", "0%")
+            sr = r.get("sharpe_ratio", "0")
+            trades = r.get("total_trades", 0)
+            balance = bot.broker._paper_balance
+            ret = pnl / balance if balance > 0 else 0
+            total_pnl += pnl
+            print(f"  {inst:<10s} {trades:>6d} {wr:>7s} {pf:>6s} {'¥' + f'{pnl:+,.0f}':>14s} {ret:>+7.1%} {dd:>7s} {sr:>6s}")
+        balance = bot.broker._paper_balance
+        total_ret = total_pnl / balance if balance > 0 else 0
+        print(f"  {'-'*10} {'-'*6} {'-'*7} {'-'*6} {'-'*14} {'-'*8} {'-'*7} {'-'*6}")
+        print(f"  {'合計':<10s} {'':>6s} {'':>7s} {'':>6s} {'¥' + f'{total_pnl:+,.0f}':>14s} {total_ret:>+7.1%}")
+        print("=" * 80)
 
     bot.broker.disconnect()
 

@@ -94,8 +94,9 @@ class TwelveDataClient:
         self._min_request_interval = 8.0  # 8 calls/min = ~7.5s between calls
 
         # Paper trading state
-        self._paper_positions: dict[str, dict[str, Any]] = {}
+        self._paper_positions: dict[str, dict[str, Any]] = {}  # key=deal_id
         self._paper_balance: float = 1_000_000.0
+        self._paper_realized_pnl: float = 0.0   # 確定済み累積損益
         self._next_deal_id: int = 1
 
     # --------------------------------------------------
@@ -160,11 +161,25 @@ class TwelveDataClient:
             "account_id": "TWELVEDATA-PAPER",
             "account_name": "Twelve Data (Paper)",
             "balance": self._paper_balance,
-            "deposit": self._paper_balance,
-            "profit_loss": 0.0,
+            "deposit": 1_000_000.0,
+            "profit_loss": self._paper_realized_pnl,
             "available": self._paper_balance,
             "currency": "JPY",
         }
+
+    def apply_trade_pnl(self, pnl: float) -> None:
+        """Apply realized P&L to paper balance after a position closes.
+
+        Args:
+            pnl: Profit/loss amount in account currency (JPY).
+        """
+        self._paper_balance += pnl
+        self._paper_realized_pnl += pnl
+        logger.info(
+            f"[PAPER] Balance updated: {pnl:+,.0f} → "
+            f"残高 ¥{self._paper_balance:,.0f} "
+            f"(累積損益 {self._paper_realized_pnl:+,.0f})"
+        )
 
     # --------------------------------------------------
     # Market Data
@@ -330,10 +345,10 @@ class TwelveDataClient:
             return pd.DataFrame()
 
         rows = []
-        for instrument, pos in self._paper_positions.items():
+        for deal_id, pos in self._paper_positions.items():
             rows.append({
-                "dealId": pos["deal_id"],
-                "epic": instrument,
+                "dealId": deal_id,
+                "epic": pos["epic"],
                 "direction": pos["direction"],
                 "size": pos["size"],
                 "level": pos["entry_price"],
@@ -379,7 +394,8 @@ class TwelveDataClient:
             deal_id = f"PAPER-{self._next_deal_id:06d}"
             self._next_deal_id += 1
 
-            self._paper_positions[epic] = {
+            self._paper_positions[deal_id] = {
+                "epic": epic,
                 "deal_id": deal_id,
                 "direction": direction,
                 "entry_price": entry_price,
@@ -421,11 +437,10 @@ class TwelveDataClient:
     ) -> dict[str, Any]:
         """Close a paper position."""
         try:
-            for epic, pos in list(self._paper_positions.items()):
-                if pos["deal_id"] == deal_id:
-                    del self._paper_positions[epic]
-                    logger.info(f"[PAPER] Closed position: {deal_id}")
-                    return {"success": True, "deal_id": deal_id, "status": "ACCEPTED"}
+            if deal_id in self._paper_positions:
+                del self._paper_positions[deal_id]
+                logger.info(f"[PAPER] Closed position: {deal_id}")
+                return {"success": True, "deal_id": deal_id, "status": "ACCEPTED"}
             return {"success": False, "reason": "Position not found"}
         except Exception as e:
             logger.error(f"Failed to close paper position {deal_id}: {e}")
@@ -442,17 +457,17 @@ class TwelveDataClient:
     ) -> dict[str, Any]:
         """Update a paper position."""
         try:
-            for epic, pos in self._paper_positions.items():
-                if pos["deal_id"] == deal_id:
-                    if stop_level is not None:
-                        pos["stop_loss"] = stop_level
-                    if limit_level is not None:
-                        pos["take_profit"] = limit_level
-                    logger.info(
-                        f"[PAPER] Updated position {deal_id}: "
-                        f"SL={stop_level}, TP={limit_level}"
-                    )
-                    return {"success": True, "deal_id": deal_id}
+            if deal_id in self._paper_positions:
+                pos = self._paper_positions[deal_id]
+                if stop_level is not None:
+                    pos["stop_loss"] = stop_level
+                if limit_level is not None:
+                    pos["take_profit"] = limit_level
+                logger.info(
+                    f"[PAPER] Updated position {deal_id}: "
+                    f"SL={stop_level}, TP={limit_level}"
+                )
+                return {"success": True, "deal_id": deal_id}
             return {"success": False, "reason": "Position not found"}
         except Exception as e:
             logger.error(f"Failed to update paper position {deal_id}: {e}")

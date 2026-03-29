@@ -47,9 +47,9 @@ _GRANULARITY_MAP = {
 class OandaClient:
     """High-level client for OANDA v20 REST API.
 
-    Handles market data retrieval and paper trade simulation.
-    Real order execution is NOT supported — this tool is for
-    analysis and paper trading only.
+    Handles market data retrieval and order execution.
+    Supports both paper trading (TRADING_MODE=paper) and
+    live trading via OANDA v20 API (TRADING_MODE=live).
     """
 
     PRACTICE_URL = "https://api-fxpractice.oanda.com"
@@ -60,6 +60,7 @@ class OandaClient:
         api_token: str,
         account_id: str,
         environment: str = "practice",
+        trading_mode: str = "paper",
     ) -> None:
         """Initialize OANDA client.
 
@@ -67,10 +68,12 @@ class OandaClient:
             api_token: OANDA v20 API access token.
             account_id: OANDA account ID.
             environment: 'practice' or 'live'.
+            trading_mode: 'paper' (simulate) or 'live' (real OANDA orders).
         """
         self.api_token = api_token
         self.account_id = account_id
         self.environment = environment
+        self.trading_mode = trading_mode
         self._base_url = (
             self.PRACTICE_URL if environment == "practice" else self.LIVE_URL
         )
@@ -155,6 +158,9 @@ class OandaClient:
                     "balance": balance,
                     "deposit": balance,
                     "profit_loss": unrealized_pl,
+                    "unrealized_pl": unrealized_pl,
+                    "realized_pl": float(account.get("pl", 0)),
+                    "nav": float(account.get("NAV", balance)),
                     "available": float(account.get("marginAvailable", balance)),
                     "currency": account.get("currency", "JPY"),
                 }
@@ -353,11 +359,54 @@ class OandaClient:
     # --------------------------------------------------
 
     def get_open_positions(self) -> pd.DataFrame:
-        """Fetch all open paper positions.
+        """Fetch all open positions (OANDA API for live, local for paper).
 
         Returns:
             DataFrame of open positions.
         """
+        if self.trading_mode == "live":
+            return self._get_live_positions()
+        return self._get_paper_positions()
+
+    def _get_live_positions(self) -> pd.DataFrame:
+        """Fetch open trades from OANDA v20 API."""
+        try:
+            resp = self._request("GET", f"/v3/accounts/{self.account_id}/openTrades")
+            if not resp or "trades" not in resp:
+                return pd.DataFrame()
+
+            rows = []
+            for trade in resp["trades"]:
+                units = float(trade.get("currentUnits", 0))
+                direction = "BUY" if units > 0 else "SELL"
+                size_units = abs(units)
+                instrument = trade.get("instrument", "")
+                # Convert OANDA units back to lots
+                if "JPY" in instrument:
+                    size_lots = size_units / 100
+                else:
+                    size_lots = size_units / 10_000
+
+                sl_order = trade.get("stopLossOrder", {})
+                tp_order = trade.get("takeProfitOrder", {})
+                rows.append({
+                    "dealId": f"OANDA-{trade['id']}",
+                    "epic": instrument,
+                    "direction": direction,
+                    "size": size_lots,
+                    "level": float(trade.get("price", 0)),
+                    "stopLevel": float(sl_order.get("price", 0)) if sl_order else None,
+                    "limitLevel": float(tp_order.get("price", 0)) if tp_order else None,
+                    "openedAt": trade.get("openTime", ""),
+                    "unrealizedPL": float(trade.get("unrealizedPL", 0)),
+                })
+            return pd.DataFrame(rows) if rows else pd.DataFrame()
+        except Exception as e:
+            logger.error(f"Failed to fetch live positions: {e}")
+            return pd.DataFrame()
+
+    def _get_paper_positions(self) -> pd.DataFrame:
+        """Return local paper positions as DataFrame."""
         if not self._paper_positions:
             return pd.DataFrame()
 
@@ -402,27 +451,135 @@ class OandaClient:
         trailing_stop: bool = False,
         trailing_stop_increment: float | None = None,
     ) -> dict[str, Any]:
-        """Open a paper position.
+        """Open a position (paper or live depending on trading_mode).
 
         Args:
             epic: Instrument identifier.
             direction: 'BUY' or 'SELL'.
-            size: Position size in units.
-            order_type: Order type (always MARKET for paper).
+            size: Position size in lots.
+            order_type: Order type.
             currency_code: Account currency.
             stop_loss: Absolute stop-loss price level.
             stop_distance: Stop distance in points.
             take_profit: Absolute take-profit price level.
             limit_distance: Limit distance in points.
-            guaranteed_stop: Ignored in paper mode.
+            guaranteed_stop: Ignored.
             trailing_stop: Enable trailing stop.
             trailing_stop_increment: Trailing stop increment.
 
         Returns:
             Deal confirmation dictionary.
         """
+        if self.trading_mode == "live":
+            return self._open_live_position(epic, direction, size, stop_loss, take_profit)
+        return self._open_paper_position(epic, direction, size, stop_loss, take_profit, trailing_stop)
+
+    @staticmethod
+    def _price_precision(epic: str) -> int:
+        """Return the decimal precision for an instrument's price.
+
+        OANDA requires JPY pairs to use 3 decimal places,
+        and most other pairs to use 5.
+        """
+        return 3 if "JPY" in epic else 5
+
+    @staticmethod
+    def _format_price(price: float, epic: str) -> str:
+        """Format a price to the correct precision for OANDA."""
+        precision = 3 if "JPY" in epic else 5
+        return f"{price:.{precision}f}"
+
+    def _lots_to_units(self, epic: str, size: float) -> int:
+        """Convert internal lot size to OANDA units.
+
+        JPY pairs: 1 lot = 100 units
+        Other pairs: 1 lot = 10,000 units
+        """
+        if "JPY" in epic:
+            return int(round(size * 100))
+        return int(round(size * 10_000))
+
+    def _open_live_position(
+        self,
+        epic: str,
+        direction: str,
+        size: float,
+        stop_loss: float | None,
+        take_profit: float | None,
+    ) -> dict[str, Any]:
+        """Place a real order via OANDA v20 API."""
         try:
-            # Get current price
+            units = self._lots_to_units(epic, size)
+            if direction == "SELL":
+                units = -units
+
+            order: dict[str, Any] = {
+                "type": "MARKET",
+                "instrument": epic,
+                "units": str(units),
+            }
+            if stop_loss is not None:
+                order["stopLossOnFill"] = {
+                    "price": self._format_price(stop_loss, epic),
+                    "timeInForce": "GTC",
+                }
+            if take_profit is not None:
+                order["takeProfitOnFill"] = {
+                    "price": self._format_price(take_profit, epic),
+                    "timeInForce": "GTC",
+                }
+
+            resp = self._request(
+                "POST",
+                f"/v3/accounts/{self.account_id}/orders",
+                json_body={"order": order},
+            )
+            if not resp:
+                return {"success": False, "reason": "No response from OANDA"}
+
+            fill = resp.get("orderFillTransaction") or resp.get("relatedTransactionIDs")
+            trade_opened = (resp.get("orderFillTransaction") or {}).get("tradeOpened", {})
+            trade_id = trade_opened.get("tradeID", "")
+            entry_price = float((resp.get("orderFillTransaction") or {}).get("price", 0))
+
+            if not trade_id:
+                reason = (resp.get("orderRejectTransaction") or {}).get("rejectReason", "Unknown")
+                logger.error(f"[LIVE] Order rejected for {epic}: {reason}")
+                return {"success": False, "reason": reason}
+
+            deal_id = f"OANDA-{trade_id}"
+            logger.info(
+                f"[LIVE] Opened {direction} {epic}: "
+                f"units={units}, entry={entry_price:.5f}, "
+                f"SL={stop_loss}, TP={take_profit}, trade_id={trade_id}"
+            )
+            return {
+                "success": True,
+                "deal_id": deal_id,
+                "deal_ref": deal_id,
+                "status": "ACCEPTED",
+                "direction": direction,
+                "epic": epic,
+                "size": size,
+                "level": entry_price,
+                "stop_level": stop_loss or 0,
+                "limit_level": take_profit or 0,
+            }
+        except Exception as e:
+            logger.error(f"Failed to open live position for {epic}: {e}")
+            return {"success": False, "reason": str(e)}
+
+    def _open_paper_position(
+        self,
+        epic: str,
+        direction: str,
+        size: float,
+        stop_loss: float | None,
+        take_profit: float | None,
+        trailing_stop: bool,
+    ) -> dict[str, Any]:
+        """Simulate a position locally without calling OANDA orders API."""
+        try:
             price_info = self.get_market_info(epic)
             if not price_info:
                 return {"success": False, "reason": "Could not get current price"}
@@ -450,7 +607,6 @@ class OandaClient:
                 f"size={size}, entry={entry_price:.5f}, "
                 f"SL={stop_loss}, TP={take_profit}"
             )
-
             return {
                 "success": True,
                 "deal_id": deal_id,
@@ -463,7 +619,6 @@ class OandaClient:
                 "stop_level": stop_loss or 0,
                 "limit_level": take_profit or 0,
             }
-
         except Exception as e:
             logger.error(f"Failed to open paper position: {e}")
             return {"success": False, "reason": str(e)}
@@ -475,10 +630,10 @@ class OandaClient:
         size: float,
         order_type: str = "MARKET",
     ) -> dict[str, Any]:
-        """Close a paper position.
+        """Close a position (paper or live).
 
         Args:
-            deal_id: The deal ID of the position to close.
+            deal_id: The deal ID (OANDA-{tradeID} for live, PAPER-XXXXXX for paper).
             direction: Opposite direction.
             size: Position size to close.
             order_type: Order type.
@@ -486,14 +641,36 @@ class OandaClient:
         Returns:
             Close confirmation dictionary.
         """
+        if self.trading_mode == "live" and deal_id.startswith("OANDA-"):
+            return self._close_live_position(deal_id)
+        return self._close_paper_position(deal_id)
+
+    def _close_live_position(self, deal_id: str) -> dict[str, Any]:
+        """Close a live OANDA trade."""
         try:
-            # Find and remove the position
+            trade_id = deal_id.removeprefix("OANDA-")
+            resp = self._request(
+                "PUT",
+                f"/v3/accounts/{self.account_id}/trades/{trade_id}/close",
+            )
+            if resp and "orderFillTransaction" in resp:
+                logger.info(f"[LIVE] Closed trade: {deal_id}")
+                return {"success": True, "deal_id": deal_id, "status": "ACCEPTED"}
+            reason = str(resp) if resp else "No response"
+            logger.error(f"[LIVE] Failed to close trade {deal_id}: {reason}")
+            return {"success": False, "reason": reason}
+        except Exception as e:
+            logger.error(f"Failed to close live position {deal_id}: {e}")
+            return {"success": False, "reason": str(e)}
+
+    def _close_paper_position(self, deal_id: str) -> dict[str, Any]:
+        """Remove a paper position from local state."""
+        try:
             for epic, pos in list(self._paper_positions.items()):
                 if pos["deal_id"] == deal_id:
                     del self._paper_positions[epic]
                     logger.info(f"[PAPER] Closed position: {deal_id}")
                     return {"success": True, "deal_id": deal_id, "status": "ACCEPTED"}
-
             return {"success": False, "reason": "Position not found"}
         except Exception as e:
             logger.error(f"Failed to close paper position {deal_id}: {e}")
@@ -507,8 +684,9 @@ class OandaClient:
         trailing_stop: bool = False,
         trailing_stop_distance: float | None = None,
         trailing_stop_increment: float | None = None,
+        epic: str = "",
     ) -> dict[str, Any]:
-        """Update stop-loss and take-profit for a paper position.
+        """Update stop-loss and take-profit (paper or live).
 
         Args:
             deal_id: Deal ID to update.
@@ -517,10 +695,53 @@ class OandaClient:
             trailing_stop: Enable trailing stop.
             trailing_stop_distance: Trailing stop distance.
             trailing_stop_increment: Trailing stop increment.
+            epic: Instrument name (for price precision).
 
         Returns:
             Update confirmation dictionary.
         """
+        if self.trading_mode == "live" and deal_id.startswith("OANDA-"):
+            return self._update_live_position(deal_id, stop_level, limit_level, epic)
+        return self._update_paper_position(deal_id, stop_level, limit_level)
+
+    def _update_live_position(
+        self,
+        deal_id: str,
+        stop_level: float | None,
+        limit_level: float | None,
+        epic: str = "",
+    ) -> dict[str, Any]:
+        """Update SL/TP for a live OANDA trade."""
+        try:
+            trade_id = deal_id.removeprefix("OANDA-")
+            body: dict[str, Any] = {}
+            if stop_level is not None:
+                body["stopLoss"] = {"price": self._format_price(stop_level, epic), "timeInForce": "GTC"}
+            if limit_level is not None:
+                body["takeProfit"] = {"price": self._format_price(limit_level, epic), "timeInForce": "GTC"}
+            if not body:
+                return {"success": True, "deal_id": deal_id}
+
+            resp = self._request(
+                "PUT",
+                f"/v3/accounts/{self.account_id}/trades/{trade_id}/orders",
+                json_body=body,
+            )
+            if resp:
+                logger.info(f"[LIVE] Updated trade {deal_id}: SL={stop_level}, TP={limit_level}")
+                return {"success": True, "deal_id": deal_id}
+            return {"success": False, "reason": "No response from OANDA"}
+        except Exception as e:
+            logger.error(f"Failed to update live position {deal_id}: {e}")
+            return {"success": False, "reason": str(e)}
+
+    def _update_paper_position(
+        self,
+        deal_id: str,
+        stop_level: float | None,
+        limit_level: float | None,
+    ) -> dict[str, Any]:
+        """Update SL/TP for a paper position."""
         try:
             for epic, pos in self._paper_positions.items():
                 if pos["deal_id"] == deal_id:
@@ -533,7 +754,6 @@ class OandaClient:
                         f"SL={stop_level}, TP={limit_level}"
                     )
                     return {"success": True, "deal_id": deal_id}
-
             return {"success": False, "reason": "Position not found"}
         except Exception as e:
             logger.error(f"Failed to update paper position {deal_id}: {e}")
@@ -557,6 +777,64 @@ class OandaClient:
     # --------------------------------------------------
     # Internal Helpers
     # --------------------------------------------------
+
+    def stream_prices(
+        self,
+        instruments: list[str],
+        on_price: Any,
+        stop_event: Any | None = None,
+    ) -> None:
+        """OANDAストリーミングAPIで価格をリアルタイム受信する。
+
+        Args:
+            instruments: 受信する通貨ペアのリスト（例: ['USD_JPY', 'EUR_USD']）
+            on_price: 価格更新コールバック on_price(instrument, bid, ask, time)
+            stop_event: threading.Event。セットされたら停止する。
+        """
+        stream_url = (
+            "https://stream-fxpractice.oanda.com"
+            if self.environment == "practice"
+            else "https://stream-fxtrade.oanda.com"
+        )
+        url = f"{stream_url}/v3/accounts/{self.account_id}/pricing/stream"
+        params = {"instruments": ",".join(instruments)}
+        headers = {
+            "Authorization": f"Bearer {self.api_token}",
+            "Accept-Datetime-Format": "RFC3339",
+        }
+        import json as _json
+        while True:
+            if stop_event and stop_event.is_set():
+                break
+            try:
+                with requests.get(
+                    url, params=params, headers=headers,
+                    stream=True, timeout=30
+                ) as resp:
+                    resp.raise_for_status()
+                    for line in resp.iter_lines():
+                        if stop_event and stop_event.is_set():
+                            return
+                        if not line:
+                            continue
+                        try:
+                            msg = _json.loads(line)
+                        except Exception:
+                            continue
+                        if msg.get("type") != "PRICE":
+                            continue
+                        instrument = msg.get("instrument", "")
+                        bids = msg.get("bids", [{}])
+                        asks = msg.get("asks", [{}])
+                        bid = float(bids[0].get("price", 0)) if bids else 0.0
+                        ask = float(asks[0].get("price", 0)) if asks else 0.0
+                        ts = msg.get("time", "")
+                        on_price(instrument, bid, ask, ts)
+            except Exception as e:
+                logger.warning(f"Price stream disconnected: {e} — reconnecting in 3s")
+                if stop_event and stop_event.is_set():
+                    break
+                time.sleep(3)
 
     def _request(
         self,

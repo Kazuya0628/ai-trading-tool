@@ -1,0 +1,37 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m json.tool)",
+      "Bash(head -5 \"/Users/k4195255/Library/CloudStorage/OneDrive-共有ライブラリ-\\(有\\)鈴真設計/Switch ROM 共有 - 課題/AiTradeTool/data/ai_analysis_log.json\")",
+      "Bash(python -c \":*)",
+      "Bash(python scripts/bulk_backtest.py)",
+      "Read(//Users/k4195255/Library/CloudStorage/OneDrive-共有ライブラリ-\\(有\\)鈴真設計/**)",
+      "Bash(ls -la \"/Users/k4195255/Library/CloudStorage/OneDrive-共有ライブラリ-\\(有\\)鈴真設計/Switch ROM 共有 - 課題/AiTradeTool/data/\")",
+      "Read(//Users/k4195255/Library/CloudStorage/OneDrive-共有ライブラリ-\\(有\\)鈴真設計/Switch ROM 共有 - 課題/AiTradeTool/**)",
+      "Bash(rm data/paper_trades.db)",
+      "Bash(python3 -c \":*)",
+      "Bash(kill 41647)",
+      "Bash(python -c \"import py_compile; py_compile.compile\\(''src/strategies/strategy_engine.py'', doraise=True\\); print\\(''strategy_engine.py OK''\\)\")",
+      "Bash(python -c \"import py_compile; py_compile.compile\\(''src/trading_bot.py'', doraise=True\\); print\\(''trading_bot.py OK''\\)\")",
+      "Bash(python -c \"import py_compile; py_compile.compile\\(''src/dashboard.py'', doraise=True\\); print\\(''dashboard.py OK''\\)\")",
+      "Bash(python -m pytest tests/ -v --timeout=30)",
+      "Bash(timeout 90 python -c \":*)",
+      "Bash(grep -v -E '\\(^\\\\[|INFO|ERROR|WARNING|See README|^$\\)')",
+      "Bash(python 2)",
+      "Bash(python -c \"import py_compile; py_compile.compile\\(''''src/dashboard.py'''', doraise=True\\); py_compile.compile\\(''''src/brokers/oanda_client.py'''', doraise=True\\); print\\(''''OK''''\\)\")",
+      "Bash(python -m pytest tests/ -q)",
+      "Bash(python -c \"import py_compile; py_compile.compile\\(''''src/trading_bot.py'''', doraise=True\\); print\\(''''OK''''\\)\")",
+      "WebSearch",
+      "Bash(find \"/Users/k4195255/Library/CloudStorage/OneDrive-共有ライブラリ-\\(有\\)鈴真設計/Switch ROM 共有 - 課題/AiTradeTool/src\" -type d)",
+      "Bash(ls -la \"/Users/k4195255/Library/CloudStorage/OneDrive-共有ライブラリ-\\(有\\)鈴真設計/Switch ROM 共有 - 課題/AiTradeTool/src/\")",
+      "Bash(ls -la \"/Users/k4195255/Library/CloudStorage/OneDrive-共有ライブラリ-\\(有\\)鈴真設計/Switch ROM 共有 - 課題/AiTradeTool/src/brokers/\")",
+      "Bash(ls -la \"/Users/k4195255/Library/CloudStorage/OneDrive-共有ライブラリ-\\(有\\)鈴真設計/Switch ROM 共有 - 課題/AiTradeTool/src/data/\")",
+      "Bash(wc -l \"/Users/k4195255/Library/CloudStorage/OneDrive-共有ライブラリ-\\(有\\)鈴真設計/Switch ROM 共有 - 課題/AiTradeTool/src/strategies/consensus_engine.py\")",
+      "Bash(python -m pytest tests/ -v --tb=short)",
+      "Bash(find \"/Users/k4195255/Library/CloudStorage/OneDrive-共有ライブラリ-\\(有\\)鈴真設計/Switch ROM 共有 - 課題/AiTradeTool/tests\" -type f -name \"test_*.py\")"
+    ],
+    "additionalDirectories": [
+      "/Users/k4195255/Library/CloudStorage/OneDrive-共有ライブラリ-(有)鈴真設計/Switch ROM 共有 - 課題/AiTradeTool"
+    ]
+  }
+}
