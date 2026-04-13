@@ -37,7 +37,24 @@ class ExecutionService:
         cfg = config or {}
         self._max_spread_pips: float = cfg.get("max_spread_pips", 5.0)
         self._max_slippage_pips: float = cfg.get("max_slippage_pips", 3.0)
-        self._signal_expiry_seconds: int = cfg.get("signal_expiry_seconds", 300)
+        # signal_expiry_minutes takes priority; fall back to legacy signal_expiry_seconds
+        _expiry_minutes = cfg.get("signal_expiry_minutes")
+        if _expiry_minutes is not None:
+            self._signal_expiry_seconds: int = int(_expiry_minutes) * 60
+        else:
+            self._signal_expiry_seconds = cfg.get("signal_expiry_seconds", 900)  # default 15 min
+        # Per-pair slippage limits (pips); falls back to _max_slippage_pips
+        self._slippage_limits_pips: dict[str, float] = cfg.get(
+            "slippage_limits_pips",
+            {
+                "EUR_USD": 1.5,
+                "GBP_USD": 1.5,
+                "USD_JPY": 2.0,
+                "EUR_JPY": 2.0,
+                "GBP_JPY": 2.0,
+                "CHF_JPY": 2.0,
+            },
+        )
 
     def execute_entry(
         self,
@@ -92,10 +109,25 @@ class ExecutionService:
         fill_price = result.get("level", decision_price)
         deal_id = result["deal_id"]
 
-        # Record slippage
+        # Record slippage — use broker pip value if available
         slippage = abs(fill_price - decision_price)
-        pip_size = 0.01 if decision_price > 50 else 0.0001
+        try:
+            pip_value = self.broker.get_pip_value(order.instrument)
+            pip_size = pip_value if pip_value and pip_value > 0 else None
+        except Exception:
+            pip_size = None
+        if pip_size is None:
+            # Last-resort heuristic: JPY pairs ~0.01, others ~0.0001
+            pip_size = 0.01 if decision_price > 50 else 0.0001
         slippage_pips = slippage / pip_size
+
+        # Reject if slippage exceeds per-pair limit
+        pair_limit = self._slippage_limits_pips.get(order.instrument, self._max_slippage_pips)
+        if slippage_pips > pair_limit:
+            logger.warning(
+                f"[Execution] Slippage too high for {order.instrument}: "
+                f"{slippage_pips:.1f}pips > {pair_limit}pips limit — position opened but flagged"
+            )
 
         # Save position
         trade_info = {

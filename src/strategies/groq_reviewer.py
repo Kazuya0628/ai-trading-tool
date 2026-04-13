@@ -33,9 +33,33 @@ class GroqReviewer:
             logger.warning("[Groq] groq パッケージがインストールされていません。pip install groq")
             self._client = None
 
+        # Daily quota circuit breaker (Groq free tier TPD limit).
+        # When 429 hits, suspend until next UTC day.
+        self._rate_limited_date: str = ""
+
     @property
     def available(self) -> bool:
-        return self._client is not None
+        if self._client is None:
+            return False
+        # Auto-reset on new day
+        from datetime import datetime as _dt
+        today = _dt.utcnow().strftime("%Y-%m-%d")
+        if self._rate_limited_date and self._rate_limited_date != today:
+            self._rate_limited_date = ""
+            logger.info("[Groq] Daily quota reset — resuming Groq calls")
+        return not self._rate_limited_date
+
+    def _handle_rate_limit(self, err: Exception) -> bool:
+        """Return True if the error is a 429 rate limit and breaker was tripped."""
+        msg = str(err)
+        if "429" in msg or "rate_limit" in msg.lower():
+            from datetime import datetime as _dt
+            self._rate_limited_date = _dt.utcnow().strftime("%Y-%m-%d")
+            logger.warning(
+                "[Groq] Daily token quota exhausted — suspending Groq until tomorrow (UTC)"
+            )
+            return True
+        return False
 
     def review_weekly_performance(
         self,
@@ -281,7 +305,8 @@ class GroqReviewer:
             return result
 
         except Exception as e:
-            logger.error(f"[Groq] レジーム分析失敗: {e}")
+            if not self._handle_rate_limit(e):
+                logger.error(f"[Groq] レジーム分析失敗: {e}")
             return self._default_regime()
 
     def _build_regime_prompt(
@@ -459,7 +484,8 @@ class GroqReviewer:
             return result
 
         except Exception as e:
-            logger.error(f"[Groq] 方向性投票失敗: {e}")
+            if not self._handle_rate_limit(e):
+                logger.error(f"[Groq] 方向性投票失敗: {e}")
             return _neutral
 
     def _build_direction_prompt(

@@ -17,7 +17,7 @@ from loguru import logger
 
 @dataclass
 class PortfolioState:
-    """Current portfolio state snapshot."""
+    """Current portfolio state snapshot (DESIGN-001 v1.3)."""
 
     nav: float = 0.0
     balance: float = 0.0
@@ -31,14 +31,22 @@ class PortfolioState:
     last_daily_reset: str = ""
     last_weekly_reset: str = ""
 
+    # NAV アンカー（DESIGN-001 v1.3 追加）
+    # 日次/週次損失はNAV基準で評価する（実現損益だけでなくUPLも含む）
+    daily_nav_anchor: float = 0.0   # UTC 00:00 時点のNAV
+    weekly_nav_anchor: float = 0.0  # 週初 UTC 時点のNAV
+    daily_loss_pct: float = 0.0
+    weekly_loss_pct: float = 0.0
+
 
 class PortfolioService:
-    """Manages portfolio-level state and risk metrics."""
+    """Manages portfolio-level state and risk metrics (DESIGN-001 v1.3)."""
 
     MAX_CURRENCY_EXPOSURE: int = 3  # Max positions with same base/quote currency
 
-    def __init__(self) -> None:
+    def __init__(self, max_currency_exposure: int = 3) -> None:
         self.state = PortfolioState()
+        self.MAX_CURRENCY_EXPOSURE = max_currency_exposure
 
     def update_from_broker(self, account_info: dict[str, Any]) -> None:
         """Update portfolio state from broker account info.
@@ -126,7 +134,68 @@ class PortfolioService:
             "weekly_realized_pl": self.state.weekly_realized_pl,
             "open_positions": self.state.open_position_count,
             "currency_exposure": dict(self.state.exposure_by_currency),
+            # NAVアンカー基準の損失率
+            "daily_nav_anchor": self.state.daily_nav_anchor,
+            "weekly_nav_anchor": self.state.weekly_nav_anchor,
+            "daily_loss_pct": round(self.state.daily_loss_pct, 2),
+            "weekly_loss_pct": round(self.state.weekly_loss_pct, 2),
         }
+
+    # --------------------------------------------------
+    # NAV アンカー管理 (DESIGN-001 v1.3)
+    # --------------------------------------------------
+
+    def roll_daily_anchor(self, nav: float) -> None:
+        """日次アンカーをリセットする（UTC 00:00 時に呼ぶ）。
+
+        Args:
+            nav: 現時点のNAV値。
+        """
+        self.state.daily_nav_anchor = nav
+        self.state.daily_loss_pct = 0.0
+        logger.info(f"[Portfolio] Daily NAV anchor rolled: ¥{nav:,.0f}")
+
+    def roll_weekly_anchor(self, nav: float) -> None:
+        """週次アンカーをリセットする（週初 UTC に呼ぶ）。
+
+        Args:
+            nav: 現時点のNAV値。
+        """
+        self.state.weekly_nav_anchor = nav
+        self.state.weekly_loss_pct = 0.0
+        logger.info(f"[Portfolio] Weekly NAV anchor rolled: ¥{nav:,.0f}")
+
+    def calculate_daily_loss_pct(self, nav: float) -> float:
+        """日次損失率を計算する（NAVアンカー基準）。
+
+        Args:
+            nav: 現在のNAV。
+
+        Returns:
+            損失率（%）。正値=損失、負値=利益。
+        """
+        anchor = self.state.daily_nav_anchor
+        if anchor <= 0:
+            return 0.0
+        loss_pct = (anchor - nav) / anchor * 100
+        self.state.daily_loss_pct = loss_pct
+        return loss_pct
+
+    def calculate_weekly_loss_pct(self, nav: float) -> float:
+        """週次損失率を計算する（NAVアンカー基準）。
+
+        Args:
+            nav: 現在のNAV。
+
+        Returns:
+            損失率（%）。正値=損失、負値=利益。
+        """
+        anchor = self.state.weekly_nav_anchor
+        if anchor <= 0:
+            return 0.0
+        loss_pct = (anchor - nav) / anchor * 100
+        self.state.weekly_loss_pct = loss_pct
+        return loss_pct
 
     def _check_resets(self) -> None:
         """Reset daily/weekly counters on date/week rollover."""
@@ -134,8 +203,14 @@ class PortfolioService:
         if self.state.last_daily_reset != today:
             self.state.daily_realized_pl = 0.0
             self.state.last_daily_reset = today
+            # アンカーが未設定の場合はここで初期化
+            if self.state.daily_nav_anchor <= 0 and self.state.nav > 0:
+                self.state.daily_nav_anchor = self.state.nav
 
         week_key = datetime.now().strftime("%Y-W%W")
         if self.state.last_weekly_reset != week_key:
             self.state.weekly_realized_pl = 0.0
             self.state.last_weekly_reset = week_key
+            # アンカーが未設定の場合はここで初期化
+            if self.state.weekly_nav_anchor <= 0 and self.state.nav > 0:
+                self.state.weekly_nav_anchor = self.state.nav

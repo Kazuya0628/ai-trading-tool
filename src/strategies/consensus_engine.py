@@ -70,12 +70,73 @@ class ConsensusResult:
 
 
 class ConsensusEngine:
-    """Algorithm-gatekeeper consensus engine with 2-voter fallback."""
+    """Algorithm-gatekeeper consensus engine with 2-voter fallback.
+
+    DESIGN-001 v1.3: 閾値はコード固定値ではなく設定値として扱う。
+    初期値はconfigから読み込み、system_state（週次レビュー後）で上書き可能。
+    """
 
     MAJORITY = 2
-    CLOSE_MIN_CONF = 80.0
-    FALLBACK_MIN_AVG_CONF = 62.0
-    THREE_VOTE_MIN_AVG_CONF = 55.0
+
+    def __init__(self, config: dict | None = None) -> None:
+        """Initialize ConsensusEngine.
+
+        Args:
+            config: consensus設定 (trading_config.yaml の consensus セクション)。
+                    未指定時は設計書デフォルト値を使用。
+        """
+        cfg = config or {}
+        self.three_vote_threshold: float = float(
+            cfg.get("three_vote_entry_threshold_initial",
+                    cfg.get("three_vote_entry_threshold", 55.0))
+        )
+        self.fallback_threshold: float = float(
+            cfg.get("fallback_entry_threshold_initial",
+                    cfg.get("fallback_entry_threshold", 62.0))
+        )
+        self.close_min_conf: float = float(
+            cfg.get("ai_close_min_confidence", 80.0)
+        )
+        self.threshold_min: float = float(cfg.get("threshold_min", 50.0))
+        self.threshold_max: float = float(cfg.get("threshold_max", 65.0))
+        self.threshold_step: float = float(cfg.get("threshold_adjust_step", 5.0))
+
+    # --- 後方互換クラス変数エイリアス（既存コードが直参照している場合の保険） ---
+    @property
+    def CLOSE_MIN_CONF(self) -> float:
+        return self.close_min_conf
+
+    @property
+    def FALLBACK_MIN_AVG_CONF(self) -> float:
+        return self.fallback_threshold
+
+    @property
+    def THREE_VOTE_MIN_AVG_CONF(self) -> float:
+        return self.three_vote_threshold
+
+    def update_thresholds(
+        self,
+        three_vote: float | None = None,
+        fallback: float | None = None,
+    ) -> None:
+        """週次レビュー等で閾値を更新する（min/max範囲内にクランプ）。
+
+        Args:
+            three_vote: 新しい3者投票閾値。
+            fallback: 新しいフォールバック閾値。
+        """
+        if three_vote is not None:
+            self.three_vote_threshold = max(
+                self.threshold_min, min(self.threshold_max, three_vote)
+            )
+        if fallback is not None:
+            self.fallback_threshold = max(
+                self.threshold_min, min(self.threshold_max, fallback)
+            )
+        logger.info(
+            f"[Consensus] Thresholds updated: 3V={self.three_vote_threshold:.0f} "
+            f"FB={self.fallback_threshold:.0f}"
+        )
 
     def decide_entry(
         self,

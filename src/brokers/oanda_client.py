@@ -1,7 +1,15 @@
-"""OANDA v20 API Client - Market data and paper trading.
+"""OANDA v20 API Client - Market data and order execution.
 
 Provides a high-level wrapper around the OANDA v20 REST API
-for fetching forex market data and simulating paper trades.
+for fetching forex market data and executing orders.
+
+Order execution policy:
+  environment=practice → All orders sent to OANDA practice account API
+  environment=live     → All orders sent to OANDA live account API
+  trading_mode=paper   → Legacy local simulation (only when no OANDA env set)
+
+Since the user always connects to an OANDA account (practice or live),
+all position and order management uses the OANDA API regardless of trading_mode.
 """
 
 from __future__ import annotations
@@ -77,6 +85,9 @@ class OandaClient:
         self._base_url = (
             self.PRACTICE_URL if environment == "practice" else self.LIVE_URL
         )
+        # Always use OANDA API when connected to an OANDA account (practice or live).
+        # Local paper simulation is only a last-resort fallback when no account is configured.
+        self._use_oanda_api: bool = bool(api_token and account_id)
         self._session: requests.Session | None = None
         self._connected = False
 
@@ -85,6 +96,10 @@ class OandaClient:
         self._paper_balance: float = 1_000_000.0  # Default 100万円
         self._paper_pnl: float = 0.0
         self._next_deal_id: int = 1
+
+        # Instrument info cache (from OANDA API)
+        self._instrument_cache: dict[str, dict[str, Any]] = {}
+        self._account_currency: str = "JPY"
 
     # --------------------------------------------------
     # Session Management
@@ -109,11 +124,15 @@ class OandaClient:
             if resp and "account" in resp:
                 account = resp["account"]
                 self._paper_balance = float(account.get("balance", self._paper_balance))
+                self._account_currency = account.get("currency", "JPY")
                 self._connected = True
                 logger.info(
                     f"Connected to OANDA ({self.environment}) "
-                    f"account={self.account_id}"
+                    f"account={self.account_id} currency={self._account_currency}"
                 )
+
+                # Pre-fetch instrument metadata from OANDA
+                self._fetch_instrument_cache()
                 return True
 
             logger.error("OANDA connection failed: invalid response")
@@ -135,6 +154,186 @@ class OandaClient:
         """Ensure the session is active."""
         if not self._connected or self._session is None:
             self.connect()
+
+    # --------------------------------------------------
+    # Instrument Metadata (from OANDA API)
+    # --------------------------------------------------
+
+    def _fetch_instrument_cache(self) -> None:
+        """Fetch and cache instrument metadata from OANDA API.
+
+        Caches pipLocation, displayPrecision, minimumTradeSize, marginRate
+        for all available instruments.
+        """
+        try:
+            resp = self._request(
+                "GET", f"/v3/accounts/{self.account_id}/instruments",
+            )
+            if resp and "instruments" in resp:
+                for inst in resp["instruments"]:
+                    name = inst["name"]
+                    self._instrument_cache[name] = {
+                        "pipLocation": inst.get("pipLocation", -4),
+                        "displayPrecision": inst.get("displayPrecision", 5),
+                        "minimumTradeSize": int(inst.get("minimumTradeSize", "1")),
+                        "maximumOrderUnits": int(inst.get("maximumOrderUnits", "100000000")),
+                        "marginRate": float(inst.get("marginRate", "0.04")),
+                        "type": inst.get("type", "CURRENCY"),
+                    }
+                logger.info(
+                    f"Instrument cache loaded: {len(self._instrument_cache)} instruments"
+                )
+        except Exception as e:
+            logger.error(f"Failed to fetch instrument cache: {e}")
+
+    def get_instrument_info(self, instrument: str) -> dict[str, Any]:
+        """Get cached instrument metadata.
+
+        Returns:
+            Dict with pipLocation, displayPrecision, etc.
+        """
+        if not self._instrument_cache:
+            self._fetch_instrument_cache()
+        return self._instrument_cache.get(instrument, {})
+
+    def get_pip_location(self, instrument: str) -> int:
+        """Get pip location exponent from OANDA (e.g., -4 for 0.0001, -2 for 0.01).
+
+        Args:
+            instrument: OANDA instrument name (e.g., 'GBP_USD').
+
+        Returns:
+            Pip location exponent. Defaults to -2 for JPY pairs, -4 for others.
+        """
+        info = self.get_instrument_info(instrument)
+        if info:
+            return info["pipLocation"]
+        return -2 if "JPY" in instrument else -4
+
+    def get_pip_value(self, instrument: str) -> float:
+        """Get the pip value (e.g., 0.01 for JPY pairs, 0.0001 for others).
+
+        Derived from OANDA's pipLocation field.
+        """
+        return 10.0 ** self.get_pip_location(instrument)
+
+    def get_pip_value_in_account_currency(
+        self, instrument: str, units: int = 1
+    ) -> float:
+        """Calculate the value of 1 pip per unit in the account currency (JPY).
+
+        Uses OANDA pricing API for live FX rate conversion.
+        For 1 unit: 1 pip move = pip_value (in quote currency)
+        If quote currency != account currency, convert via live rate.
+
+        Args:
+            instrument: OANDA instrument (e.g., 'GBP_USD').
+            units: Number of units (default 1).
+
+        Returns:
+            Value of 1 pip in account currency (JPY) for the given units.
+        """
+        pip_value = self.get_pip_value(instrument)
+        # Determine quote currency (right side of pair)
+        parts = instrument.split("_")
+        quote_currency = parts[1] if len(parts) == 2 else ""
+
+        if quote_currency == self._account_currency:
+            # e.g., USD_JPY — pip is already in JPY
+            return pip_value * units
+
+        # Need to convert quote currency to account currency
+        # e.g., GBP_USD → quote=USD, need USD→JPY rate
+        conversion_rate = self._get_conversion_rate(quote_currency, self._account_currency)
+        return pip_value * units * conversion_rate
+
+    def _get_conversion_rate(self, from_currency: str, to_currency: str) -> float:
+        """Get live FX rate to convert from one currency to another.
+
+        Tries {from}_{to} first, then 1/{to}_{from}.
+
+        Args:
+            from_currency: Source currency (e.g., 'USD').
+            to_currency: Target currency (e.g., 'JPY').
+
+        Returns:
+            Conversion rate. Returns 1.0 on failure.
+        """
+        if from_currency == to_currency:
+            return 1.0
+
+        # Try direct pair
+        direct_pair = f"{from_currency}_{to_currency}"
+        rate = self._get_mid_price(direct_pair)
+        if rate > 0:
+            return rate
+
+        # Try inverse pair
+        inverse_pair = f"{to_currency}_{from_currency}"
+        rate = self._get_mid_price(inverse_pair)
+        if rate > 0:
+            return 1.0 / rate
+
+        logger.warning(f"Could not get conversion rate {from_currency}→{to_currency}")
+        return 1.0
+
+    def _get_mid_price(self, instrument: str) -> float:
+        """Get the mid price for an instrument from OANDA pricing API."""
+        try:
+            resp = self._request(
+                "GET",
+                f"/v3/accounts/{self.account_id}/pricing",
+                params={"instruments": instrument},
+            )
+            if resp and "prices" in resp and resp["prices"]:
+                price = resp["prices"][0]
+                bids = price.get("bids", [{}])
+                asks = price.get("asks", [{}])
+                bid = float(bids[0].get("price", 0)) if bids else 0
+                ask = float(asks[0].get("price", 0)) if asks else 0
+                if bid > 0 and ask > 0:
+                    return (bid + ask) / 2
+        except Exception:
+            pass
+        return 0.0
+
+    def calculate_units(
+        self,
+        instrument: str,
+        risk_amount_account: float,
+        stop_distance_price: float,
+    ) -> int:
+        """Calculate the number of OANDA units for a given risk amount.
+
+        This is the CORRECT way to size positions:
+        units = risk_amount / (stop_distance * pip_value_per_unit_in_account_currency)
+
+        Args:
+            instrument: OANDA instrument (e.g., 'GBP_USD').
+            risk_amount_account: Max loss in account currency (JPY).
+            stop_distance_price: Absolute price distance to stop loss.
+
+        Returns:
+            Number of units (always positive).
+        """
+        pip_value = self.get_pip_value(instrument)
+        if pip_value <= 0 or stop_distance_price <= 0:
+            return 0
+
+        stop_pips = stop_distance_price / pip_value
+        pip_value_per_unit = self.get_pip_value_in_account_currency(instrument, units=1)
+
+        if pip_value_per_unit <= 0 or stop_pips <= 0:
+            return 0
+
+        units = risk_amount_account / (stop_pips * pip_value_per_unit)
+
+        # Respect OANDA maximum
+        info = self.get_instrument_info(instrument)
+        max_units = info.get("maximumOrderUnits", 100_000_000)
+        units = min(units, max_units)
+
+        return max(int(units), 1)
 
     # --------------------------------------------------
     # Account Information
@@ -364,7 +563,7 @@ class OandaClient:
         Returns:
             DataFrame of open positions.
         """
-        if self.trading_mode == "live":
+        if self._use_oanda_api:
             return self._get_live_positions()
         return self._get_paper_positions()
 
@@ -381,11 +580,6 @@ class OandaClient:
                 direction = "BUY" if units > 0 else "SELL"
                 size_units = abs(units)
                 instrument = trade.get("instrument", "")
-                # Convert OANDA units back to lots
-                if "JPY" in instrument:
-                    size_lots = size_units / 100
-                else:
-                    size_lots = size_units / 10_000
 
                 sl_order = trade.get("stopLossOrder", {})
                 tp_order = trade.get("takeProfitOrder", {})
@@ -393,7 +587,7 @@ class OandaClient:
                     "dealId": f"OANDA-{trade['id']}",
                     "epic": instrument,
                     "direction": direction,
-                    "size": size_lots,
+                    "size": size_units,  # OANDA units (not lots)
                     "level": float(trade.get("price", 0)),
                     "stopLevel": float(sl_order.get("price", 0)) if sl_order else None,
                     "limitLevel": float(tp_order.get("price", 0)) if tp_order else None,
@@ -470,34 +664,24 @@ class OandaClient:
         Returns:
             Deal confirmation dictionary.
         """
-        if self.trading_mode == "live":
+        if self._use_oanda_api:
             return self._open_live_position(epic, direction, size, stop_loss, take_profit)
         return self._open_paper_position(epic, direction, size, stop_loss, take_profit, trailing_stop)
 
-    @staticmethod
-    def _price_precision(epic: str) -> int:
+    def _price_precision(self, epic: str) -> int:
         """Return the decimal precision for an instrument's price.
 
-        OANDA requires JPY pairs to use 3 decimal places,
-        and most other pairs to use 5.
+        Uses OANDA API's displayPrecision field from instrument cache.
         """
-        return 3 if "JPY" in epic else 5
+        info = self.get_instrument_info(epic)
+        if info:
+            return info["displayPrecision"]
+        return 3 if "JPY" in epic else 5  # last-resort fallback
 
-    @staticmethod
-    def _format_price(price: float, epic: str) -> str:
+    def _format_price(self, price: float, epic: str) -> str:
         """Format a price to the correct precision for OANDA."""
-        precision = 3 if "JPY" in epic else 5
+        precision = self._price_precision(epic)
         return f"{price:.{precision}f}"
-
-    def _lots_to_units(self, epic: str, size: float) -> int:
-        """Convert internal lot size to OANDA units.
-
-        JPY pairs: 1 lot = 100 units
-        Other pairs: 1 lot = 10,000 units
-        """
-        if "JPY" in epic:
-            return int(round(size * 100))
-        return int(round(size * 10_000))
 
     def _open_live_position(
         self,
@@ -507,9 +691,13 @@ class OandaClient:
         stop_loss: float | None,
         take_profit: float | None,
     ) -> dict[str, Any]:
-        """Place a real order via OANDA v20 API."""
+        """Place a real order via OANDA v20 API.
+
+        Args:
+            size: Number of OANDA units (NOT lots).
+        """
         try:
-            units = self._lots_to_units(epic, size)
+            units = int(round(size))
             if direction == "SELL":
                 units = -units
 
@@ -548,8 +736,9 @@ class OandaClient:
                 return {"success": False, "reason": reason}
 
             deal_id = f"OANDA-{trade_id}"
+            tag = "PRACTICE" if self.environment == "practice" else "LIVE"
             logger.info(
-                f"[LIVE] Opened {direction} {epic}: "
+                f"[{tag}] Opened {direction} {epic}: "
                 f"units={units}, entry={entry_price:.5f}, "
                 f"SL={stop_loss}, TP={take_profit}, trade_id={trade_id}"
             )
@@ -641,12 +830,12 @@ class OandaClient:
         Returns:
             Close confirmation dictionary.
         """
-        if self.trading_mode == "live" and deal_id.startswith("OANDA-"):
+        if self._use_oanda_api:
             return self._close_live_position(deal_id)
         return self._close_paper_position(deal_id)
 
     def _close_live_position(self, deal_id: str) -> dict[str, Any]:
-        """Close a live OANDA trade."""
+        """Close an OANDA trade (practice or live account)."""
         try:
             trade_id = deal_id.removeprefix("OANDA-")
             resp = self._request(
@@ -654,13 +843,25 @@ class OandaClient:
                 f"/v3/accounts/{self.account_id}/trades/{trade_id}/close",
             )
             if resp and "orderFillTransaction" in resp:
-                logger.info(f"[LIVE] Closed trade: {deal_id}")
-                return {"success": True, "deal_id": deal_id, "status": "ACCEPTED"}
+                fill = resp["orderFillTransaction"]
+                realized_pl = float(fill.get("pl", 0))
+                exit_price = float(fill.get("price", 0))
+                logger.info(
+                    f"[OANDA] Closed trade: {deal_id} "
+                    f"exit={exit_price} pl={realized_pl:+.2f}"
+                )
+                return {
+                    "success": True,
+                    "deal_id": deal_id,
+                    "status": "ACCEPTED",
+                    "realized_pl": realized_pl,
+                    "exit_price": exit_price,
+                }
             reason = str(resp) if resp else "No response"
-            logger.error(f"[LIVE] Failed to close trade {deal_id}: {reason}")
+            logger.error(f"[OANDA] Failed to close trade {deal_id}: {reason}")
             return {"success": False, "reason": reason}
         except Exception as e:
-            logger.error(f"Failed to close live position {deal_id}: {e}")
+            logger.error(f"Failed to close OANDA position {deal_id}: {e}")
             return {"success": False, "reason": str(e)}
 
     def _close_paper_position(self, deal_id: str) -> dict[str, Any]:
@@ -700,7 +901,7 @@ class OandaClient:
         Returns:
             Update confirmation dictionary.
         """
-        if self.trading_mode == "live" and deal_id.startswith("OANDA-"):
+        if self._use_oanda_api:
             return self._update_live_position(deal_id, stop_level, limit_level, epic)
         return self._update_paper_position(deal_id, stop_level, limit_level)
 
@@ -773,6 +974,123 @@ class OandaClient:
             Default neutral sentiment.
         """
         return {"long_pct": 50, "short_pct": 50, "market_id": market_id}
+
+    # --------------------------------------------------
+    # OANDA API - Source of Truth for Position Data
+    # --------------------------------------------------
+
+    def get_positions(self) -> list[dict[str, Any]]:
+        """Get all open positions as a list of dicts.
+
+        OANDA API is the single source of truth for position data.
+        Only AI metadata (pattern, confidence, signal_id) is stored locally.
+
+        Returns:
+            List of position dicts with deal_id, instrument, direction, size, etc.
+        """
+        if self._use_oanda_api:
+            try:
+                resp = self._request("GET", f"/v3/accounts/{self.account_id}/openTrades")
+                if not resp or "trades" not in resp:
+                    return []
+                result = []
+                for trade in resp["trades"]:
+                    units = float(trade.get("currentUnits", 0))
+                    sl_order = trade.get("stopLossOrder", {})
+                    tp_order = trade.get("takeProfitOrder", {})
+                    result.append({
+                        "deal_id": f"OANDA-{trade['id']}",
+                        "instrument": trade.get("instrument", ""),
+                        "direction": "BUY" if units > 0 else "SELL",
+                        "size": abs(units),
+                        "entry_price": float(trade.get("price", 0)),
+                        "stop_loss": float(sl_order.get("price", 0) or 0) if sl_order else 0.0,
+                        "take_profit": float(tp_order.get("price", 0) or 0) if tp_order else 0.0,
+                        "unrealized_pl": float(trade.get("unrealizedPL", 0)),
+                        "open_time": trade.get("openTime", ""),
+                    })
+                return result
+            except Exception as e:
+                logger.error(f"Failed to get positions from OANDA: {e}")
+                return []
+
+        # Paper mode: convert _paper_positions dict to list
+        return [
+            {
+                "deal_id": pos["deal_id"],
+                "instrument": epic,
+                "direction": pos["direction"],
+                "size": pos["size"],
+                "entry_price": pos["entry_price"],
+                "stop_loss": pos.get("stop_loss", 0) or 0.0,
+                "take_profit": pos.get("take_profit", 0) or 0.0,
+                "unrealized_pl": 0.0,
+                "open_time": pos.get("opened_at", ""),
+            }
+            for epic, pos in self._paper_positions.items()
+        ]
+
+    def get_closed_trade(self, trade_id: str) -> dict[str, Any] | None:
+        """Fetch a single closed trade's details from OANDA API.
+
+        Used to get the actual realizedPL for a closed position.
+
+        Args:
+            trade_id: Deal ID (e.g., 'OANDA-123' or raw trade ID '123').
+
+        Returns:
+            Dict with realized_pl, exit_price, close_time, or None on failure.
+        """
+        if not self._use_oanda_api:
+            return None
+        try:
+            raw_id = trade_id.removeprefix("OANDA-")
+            resp = self._request("GET", f"/v3/accounts/{self.account_id}/trades/{raw_id}")
+            if not resp or "trade" not in resp:
+                return None
+            trade = resp["trade"]
+            return {
+                "trade_id": trade_id,
+                "realized_pl": float(trade.get("realizedPL", 0)),
+                "exit_price": float(trade.get("averageClosePrice", 0) or 0),
+                "close_time": trade.get("closeTime", ""),
+            }
+        except Exception as e:
+            logger.error(f"Failed to get closed trade {trade_id}: {e}")
+            return None
+
+    def get_closed_trades(self, count: int = 50) -> list[dict[str, Any]]:
+        """Fetch recent closed trades from OANDA API.
+
+        Args:
+            count: Number of trades to fetch (max 500).
+
+        Returns:
+            List of closed trade dicts with realized_pl, exit_price, etc.
+        """
+        if not self._use_oanda_api:
+            return []
+        try:
+            resp = self._request(
+                "GET",
+                f"/v3/accounts/{self.account_id}/trades",
+                params={"state": "CLOSED", "count": min(count, 500)},
+            )
+            if not resp or "trades" not in resp:
+                return []
+            return [
+                {
+                    "trade_id": f"OANDA-{t['id']}",
+                    "instrument": t.get("instrument", ""),
+                    "realized_pl": float(t.get("realizedPL", 0)),
+                    "exit_price": float(t.get("averageClosePrice", 0) or 0),
+                    "close_time": t.get("closeTime", ""),
+                }
+                for t in resp["trades"]
+            ]
+        except Exception as e:
+            logger.error(f"Failed to get closed trades from OANDA: {e}")
+            return []
 
     # --------------------------------------------------
     # Internal Helpers
@@ -863,30 +1181,53 @@ class OandaClient:
             })
 
         url = f"{self._base_url}{path}"
+        max_retries = 3
+        last_err: Exception | None = None
 
-        try:
-            resp = self._session.request(
-                method, url, params=params, json=json_body, timeout=30
-            )
-
-            if resp.status_code == 429:
-                # Rate limited — wait and retry once
-                retry_after = int(resp.headers.get("Retry-After", "1"))
-                logger.warning(f"Rate limited, waiting {retry_after}s...")
-                time.sleep(retry_after)
+        for attempt in range(1, max_retries + 1):
+            try:
                 resp = self._session.request(
                     method, url, params=params, json=json_body, timeout=30
                 )
 
-            resp.raise_for_status()
-            return resp.json()
+                if resp.status_code == 429:
+                    # Rate limited — wait and retry once
+                    retry_after = int(resp.headers.get("Retry-After", "1"))
+                    logger.warning(f"Rate limited, waiting {retry_after}s...")
+                    time.sleep(retry_after)
+                    resp = self._session.request(
+                        method, url, params=params, json=json_body, timeout=30
+                    )
 
-        except requests.exceptions.HTTPError as e:
-            logger.error(f"OANDA API error: {e} - {resp.text if resp else ''}")
-            return None
-        except requests.exceptions.RequestException as e:
-            logger.error(f"OANDA request failed: {e}")
-            return None
+                resp.raise_for_status()
+                return resp.json()
+
+            except requests.exceptions.HTTPError as e:
+                logger.error(f"OANDA API error: {e} - {resp.text if resp else ''}")
+                return None
+            except requests.exceptions.ConnectionError as e:
+                # DNS failure, connection reset, etc. — retry with backoff
+                last_err = e
+                if attempt < max_retries:
+                    wait = 2 ** attempt  # 2s, 4s
+                    logger.warning(
+                        f"OANDA connection error (attempt {attempt}/{max_retries}), "
+                        f"retrying in {wait}s: {e}"
+                    )
+                    time.sleep(wait)
+                    # Re-create session in case connection pool is stale
+                    self._session = requests.Session()
+                    self._session.headers.update({
+                        "Authorization": f"Bearer {self.api_token}",
+                        "Content-Type": "application/json",
+                        "Accept-Datetime-Format": "RFC3339",
+                    })
+            except requests.exceptions.RequestException as e:
+                logger.error(f"OANDA request failed: {e}")
+                return None
+
+        logger.error(f"OANDA request failed after {max_retries} retries: {last_err}")
+        return None
 
     @staticmethod
     def _candles_to_dataframe(candles: list[dict]) -> pd.DataFrame:

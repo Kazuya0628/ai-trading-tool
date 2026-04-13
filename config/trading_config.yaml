@@ -1,105 +1,148 @@
 # ============================================
-# AI FX Trading Tool - Configuration
+# AI FX Trading Tool - Configuration (DESIGN-001 v1.3)
 # ============================================
-# Based on AI Sennin's methodology:
-# - Pattern recognition (Double Bottom, Double Top, Head & Shoulders)
-# - Multi-timeframe analysis
-# - AI visual chart analysis using Gemini
-# - Systematic backtesting with 3+ years data
-# - Risk management with strict stop-loss
-#
+# Based on AI Sennin's methodology
 # Data Source: OANDA v20 API (Practice Account)
+# Secret keys are in .env (never in this file)
+
+# ============================================
+# Application Settings
+# ============================================
+app:
+  name: "AI FX Trading Tool"
+  mode: "paper"              # paper / backtest / analysis / safe_stop / analysis_only
+  phase: 1                   # 1 / 2 / 3
+  timezone: "UTC"
+  account_currency: "JPY"
+
+# ============================================
+# Broker Settings
+# ============================================
+broker:
+  provider: "oanda"
+  environment: "practice"
+  account_id_env: "OANDA_ACCOUNT_ID"
+  token_env: "OANDA_API_TOKEN"
+
+# ============================================
+# Data Source Settings
+# ============================================
+data:
+  primary_source: "oanda"
+  backup_source: "twelvedata"
+  warmup_bars:
+    day: 300
+    h4: 500
+    h1: 500
+    m5: 300
+  allow_backup_analysis_only: true
 
 # ============================================
 # Trading Pairs (OANDA Instruments)
 # ============================================
+# NOTE: pip_value and min_lot are NOT stored here.
+#       All instrument metadata is fetched from OANDA API.
+pairs:
+  active:
+    - "USD_JPY"
+    - "EUR_USD"
+    - "GBP_JPY"
+    - "EUR_JPY"
+    - "GBP_USD"
+    - "CHF_JPY"
+  registered:
+    - "AUD_USD"
+
+# Legacy compatibility (read by existing code, will be deprecated)
 trading:
   pairs:
     - instrument: "USD_JPY"
       name: "USD/JPY"
-      min_lot: 1.0
-      pip_value: 0.01
     - instrument: "EUR_USD"
       name: "EUR/USD"
-      min_lot: 1.0
-      pip_value: 0.0001
     - instrument: "GBP_USD"
       name: "GBP/USD"
-      min_lot: 1.0
-      pip_value: 0.0001
     - instrument: "EUR_JPY"
       name: "EUR/JPY"
-      min_lot: 1.0
-      pip_value: 0.01
     - instrument: "GBP_JPY"
       name: "GBP/JPY"
-      min_lot: 1.0
-      pip_value: 0.01
     - instrument: "AUD_USD"
       name: "AUD/USD"
-      min_lot: 1.0
-      pip_value: 0.0001
     - instrument: "CHF_JPY"
       name: "CHF/JPY"
-      min_lot: 1.0
-      pip_value: 0.01
 
-  # Active pairs to trade (subset of above)
   active_pairs:
     - "USD_JPY"
     - "EUR_USD"
     - "GBP_JPY"
-    - "EUR_JPY"    # PF 1.22 - 追加 (2026-03-26)
+    - "EUR_JPY"
     - "GBP_USD"
-    - "CHF_JPY"    # PF 1.29, DD 6.7% - 追加 (2026-03-26)
+    - "CHF_JPY"
 
 # ============================================
 # Timeframe Configuration (Multi-Timeframe)
 # ============================================
 timeframes:
-  # Primary analysis timeframes
-  primary: "HOUR_4"      # 4-hour chart for pattern detection
-  secondary: "HOUR"       # 1-hour chart for entry timing
-  trend: "DAY"            # Daily chart for overall trend
+  trend: "DAY"               # Daily chart for overall trend
+  signal: "HOUR_4"           # 4-hour chart for pattern detection
+  entry_context: "HOUR"      # 1-hour chart for entry timing
 
-  # Available (IG-style names mapped to OANDA granularities):
-  # MINUTE, MINUTE_5, MINUTE_15, MINUTE_30,
-  # HOUR, HOUR_2, HOUR_3, HOUR_4, DAY, WEEK, MONTH
-  # Or use OANDA native: M1, M5, M15, M30, H1, H2, H3, H4, D, W, M
+  # Legacy aliases (backward compat)
+  primary: "HOUR_4"
+  secondary: "HOUR"
+
+# ============================================
+# Scheduler (Layer 0/1/2)
+# ============================================
+scheduler:
+  layer0_interval_minutes: 5
+  layer0_offset_seconds: 10
+  layer1_h4_offset_seconds: 15
+  layer2_interval_minutes: 5
+  layer2_offset_seconds: 40
+  h4_slots_utc: [0, 4, 8, 12, 16, 20]
+
+# ============================================
+# Strategy Settings
+# ============================================
+strategy:
+  pattern_score_min: 60
+  structural_rr_min: 1.2
+  allowed_patterns:
+    - "double_bottom"
+    - "double_top"
+    - "inverse_head_shoulders"
+    - "head_shoulders"
+    - "channel_breakout"
+    - "ma_crossover"
 
 # ============================================
 # AI Pattern Recognition Settings
 # ============================================
 pattern_recognition:
-  # Patterns to detect (AI Sennin's methodology)
   enabled_patterns:
-    - "double_bottom"           # W-shape reversal
-    - "double_top"              # M-shape reversal
-    - "inverse_head_shoulders"  # Complex reversal
-    - "head_shoulders"          # Bearish reversal
-    - "channel_breakout"        # Breakout strategy
-    - "ma_crossover"            # Moving average crossover
+    - "double_bottom"
+    - "double_top"
+    - "inverse_head_shoulders"
+    - "head_shoulders"
+    - "channel_breakout"
+    - "ma_crossover"
 
-  # Double Bottom specific settings
   double_bottom:
-    # "Right-side up" variant preferred (second trough higher)
     prefer_higher_low: true
     min_pattern_bars: 20
     max_pattern_bars: 100
     neckline_break_confirmation: true
 
-  # Inverse Head & Shoulders
   inverse_head_shoulders:
     prefer_right_shoulder_up: true
     min_pattern_bars: 30
     max_pattern_bars: 150
 
-  # Channel Breakout
   channel_breakout:
     lookback_period: 20
     breakout_threshold_atr_multiple: 1.5
 
-  # Moving Average Crossover
   ma_crossover:
     fast_period: 20
     slow_period: 50
@@ -109,43 +152,47 @@ pattern_recognition:
 # Technical Indicators
 # ============================================
 indicators:
-  # Moving Averages
   sma_periods: [20, 50, 100, 200]
   ema_periods: [9, 21, 55, 200]
-
-  # RSI
   rsi_period: 14
   rsi_overbought: 70
   rsi_oversold: 30
-
-  # MACD
   macd_fast: 12
   macd_slow: 26
   macd_signal: 9
-
-  # Bollinger Bands
   bb_period: 20
   bb_std: 2.0
-
-  # ATR (for stop-loss calculation)
   atr_period: 14
-
-  # ADX (trend strength)
   adx_period: 14
   adx_trend_threshold: 25
 
 # ============================================
-# AI Visual Analysis (Gemini)
+# AI Analysis (Gemini + Groq)
 # ============================================
+ai:
+  gemini:
+    enabled: true
+    model: "gemini-2.5-flash"
+    daily_soft_limit: 16
+    daily_hard_limit: 18
+    per_h4_cycle_limit: 3
+    chart_width: 1200
+    chart_height: 800
+    chart_style: "charles"
+    ai_close_freshness_minutes: 20
+
+  groq:
+    enabled: true
+    model: "llama-3.3-70b-versatile"
+    regime_ttl_minutes: 60
+
+# Legacy alias for ai_analysis section
 ai_analysis:
   enabled: true
   model: "gemini-2.5-flash"
-  # Chart image settings
   chart_width: 1200
   chart_height: 800
   chart_style: "charles"
-
-  # Analysis prompt template
   prompt_template: |
     Analyze this FX chart image. Identify if any of the following patterns are present:
     1. Double Bottom (W-shape) - especially "right-side up" variant with higher second low
@@ -174,103 +221,168 @@ ai_analysis:
     }
 
 # ============================================
+# Consensus Engine
+# ============================================
+consensus:
+  three_vote_entry_threshold_initial: 55
+  fallback_entry_threshold_initial: 62
+  threshold_min: 50
+  threshold_max: 65
+  threshold_adjust_step: 5
+  ai_close_min_confidence: 80
+
+# ============================================
 # Risk Management
 # ============================================
 risk_management:
   # Position sizing
-  risk_per_trade_pct: 1.0          # Risk 1% of account per trade
+  risk_per_trade_pct: 1.0
   max_position_size_lots: 10.0
   max_open_positions: 6
   max_positions_per_pair: 2
 
+  # Phase 1 fixed risk
+  base_risk_pct_phase1: 0.5
+
   # Stop Loss
-  stop_loss_atr_multiple: 2.0      # SL = 2x ATR below entry
+  stop_loss_atr_multiple: 2.0
   min_stop_loss_pips: 10
   max_stop_loss_pips: 100
 
   # Risk:Reward filter
-  min_risk_reward_ratio: 0.5       # Minimum R:R to accept signal
+  min_risk_reward_ratio: 0.5
 
   # Take Profit
-  take_profit_rr_ratio: 2.0        # TP = 2:1 reward:risk ratio
+  take_profit_rr_ratio: 2.0
   trailing_stop_enabled: true
   trailing_stop_atr_multiple: 1.5
 
   # Daily limits
-  max_daily_loss_pct: 2.0          # Stop trading if daily loss > 2%
+  max_daily_loss_pct: 2.0
   max_daily_trades: 10
   max_weekly_loss_pct: 5.0
 
   # Drawdown control
-  max_drawdown_pct: 10.0           # Stop all trading if drawdown > 10%
+  max_drawdown_pct: 10.0
   drawdown_cooldown_hours: 24
 
-  # Signal confidence threshold (auto-adjusted weekly based on PF)
-  confidence_threshold: 55             # Minimum AI confidence % to accept signal
-  confidence_threshold_min: 50         # Floor: never go below this
-  confidence_threshold_max: 65         # Ceiling: never go above this
-  confidence_threshold_step: 5         # Step size for weekly auto-adjustment
+  # Signal confidence threshold
+  confidence_threshold: 55
+  confidence_threshold_min: 50
+  confidence_threshold_max: 65
+  confidence_threshold_step: 5
 
-  # Adaptive Risk Control (AI-driven dynamic adjustment)
+  # Currency exposure
+  max_currency_exposure_count: 3
+
+  # Dynamic position limits (based on risk multiplier)
+  dynamic_position_limits:
+    ge_0_8: 6
+    ge_0_5: 5
+    ge_0_3: 4
+    lt_0_3: 3
+
+  # Adaptive Risk Control (AI-driven)
   adaptive:
-    performance_window: 20           # Rolling window of recent trades
-    loss_scale_factor: 0.75          # Risk × 0.75 per consecutive loss
-    min_loss_scale: 0.25             # Floor: never below 25% of base risk
-    max_consecutive_losses: 5        # Force cooldown after 5 consecutive losses
-    pattern_disable_win_rate: 0.25   # Disable patterns with <25% win rate
-    drawdown_thresholds:             # Progressive risk reduction
+    performance_window: 20
+    loss_scale_factor: 0.75
+    min_loss_scale: 0.25
+    max_consecutive_losses: 5
+    pattern_disable_win_rate: 0.25
+    drawdown_thresholds:
       - dd_pct: 3.0
-        scale: 0.75                  # DD 3%+ → risk × 0.75
+        scale: 0.75
       - dd_pct: 5.0
-        scale: 0.50                  # DD 5%+ → risk × 0.50
+        scale: 0.50
       - dd_pct: 7.0
-        scale: 0.25                  # DD 7%+ → risk × 0.25
-    # Dynamic position limit (adaptive)
-    base_max_positions: 6            # ベースのポジション上限
-    position_limit_tiers:            # リスク倍率に応じた動的上限
+        scale: 0.25
+    base_max_positions: 6
+    position_limit_tiers:
       - multiplier_min: 0.8
-        positions: 6                 # 好調時: 最大6ポジション
+        positions: 6
       - multiplier_min: 0.5
-        positions: 5                 # 通常時: 5
+        positions: 5
       - multiplier_min: 0.3
-        positions: 4                 # やや不調: 4に縮小
+        positions: 4
       - multiplier_min: 0.0
-        positions: 3                 # 不調時: 最低3
-
-# ============================================
-# Backtesting Configuration
-# ============================================
-backtesting:
-  # Data period (AI Sennin recommends 3+ years)
-  lookback_years: 3
-  initial_capital: 1000000         # 100万円
-  commission_per_trade: 0.0        # Spread is included
-  slippage_pips: 0.5
-
-  # Walk-forward optimization
-  in_sample_pct: 70
-  out_sample_pct: 30
-
-  # Performance targets (AI Sennin's metrics)
-  min_profit_factor: 1.2
-  min_win_rate: 0.35               # 35% win rate is acceptable with good R:R
-  target_win_rate: 0.60            # 60% target
-  min_sharpe_ratio: 1.0
+        positions: 3
 
 # ============================================
 # Execution Settings
 # ============================================
 execution:
-  # Order type
-  order_type: "MARKET"             # MARKET or LIMIT
+  order_type: "MARKET"
   limit_distance_pips: 2
+  signal_expiry_minutes: 15
+  spread_filter_multiplier: 1.5
+  use_price_bound: true
 
-  # Timing
-  check_interval_seconds: 300      # Check every 5 minutes
+  slippage_limits_pips:
+    EUR_USD: 1.5
+    GBP_USD: 1.5
+    USD_JPY: 2.0
+    EUR_JPY: 2.0
+    GBP_JPY: 2.0
+    CHF_JPY: 2.0
+
+  check_interval_seconds: 300
   trading_hours:
-    start: "00:00"                 # FX is 24h but can restrict
+    start: "00:00"
     end: "23:59"
-  avoid_news_minutes: 30           # Avoid trading 30 min around news
+  avoid_news_minutes: 30
+
+# ============================================
+# Portfolio Settings
+# ============================================
+portfolio:
+  use_nav_anchors: true
+  anchor_roll_timezone: "UTC"
+
+# ============================================
+# Dashboard Settings
+# ============================================
+dashboard:
+  enabled: true
+  host: "127.0.0.1"
+  port: 5000
+  refresh_seconds: 30
+
+# ============================================
+# Notifications
+# ============================================
+notifications:
+  line_enabled: true
+  email_enabled: true
+  discord_enabled: true
+  notify_on_startup: true
+  notify_on_entry: true
+  notify_on_close: true
+  notify_on_drawdown_alert: true
+  notify_on_daily_summary: true
+  notify_on_error: true
+
+# ============================================
+# Backtesting Configuration
+# ============================================
+backtesting:
+  enabled: true
+  lookback_years: 3
+  initial_capital: 1000000
+  commission_per_trade: 0.0
+  slippage_pips: 0.5
+
+  in_sample_pct: 70
+  out_sample_pct: 30
+
+  min_profit_factor: 1.2
+  min_win_rate: 0.35
+  target_win_rate: 0.60
+  min_sharpe_ratio: 1.0
+
+  slippage_model: "conservative"
+  spread_model: "median_or_fallback"
+  fill_model: "next_bar_or_next_m1"
+  forbid_same_bar_fill: true
 
 # ============================================
 # Logging

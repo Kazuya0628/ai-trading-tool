@@ -14,6 +14,7 @@ import io
 import json
 import tempfile
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -53,6 +54,10 @@ class AIChartAnalyzer:
         # In-memory cache: key -> {"result": ..., "expires_at": float}
         self._cache: dict[str, dict] = {}
         self._cache_ttl: int = self.config.get("cache_ttl_seconds", 3600)  # 1h default
+
+        # Gemini daily quota circuit breaker: trip on 429/resource exhausted.
+        # Auto-resets on next UTC day.
+        self._rate_limited_utc_date: str = ""
 
         if api_key:
             self._init_model()
@@ -261,6 +266,10 @@ class AIChartAnalyzer:
             logger.warning("Gemini not initialized, skipping AI analysis")
             return PatternSignal(PatternType.NO_SIGNAL, SignalDirection.NONE, 0)
 
+        if self._is_rate_limited_today():
+            logger.debug("Gemini suspended for current UTC day due to prior 429")
+            return PatternSignal(PatternType.NO_SIGNAL, SignalDirection.NONE, 0)
+
         # Generate chart image if not provided
         if image_bytes is None:
             if df is not None:
@@ -314,8 +323,29 @@ class AIChartAnalyzer:
                 return PatternSignal(PatternType.NO_SIGNAL, SignalDirection.NONE, 0)
 
         except Exception as e:
+            if self._handle_rate_limit(e):
+                return PatternSignal(PatternType.NO_SIGNAL, SignalDirection.NONE, 0)
             logger.error(f"AI chart analysis failed: {e}")
             return PatternSignal(PatternType.NO_SIGNAL, SignalDirection.NONE, 0)
+
+    def _is_rate_limited_today(self) -> bool:
+        """Return whether Gemini calls are suspended for current UTC day."""
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        if self._rate_limited_utc_date and self._rate_limited_utc_date != today:
+            self._rate_limited_utc_date = ""
+            logger.info("[Gemini] Daily quota reset — resuming Gemini calls")
+        return bool(self._rate_limited_utc_date)
+
+    def _handle_rate_limit(self, err: Exception) -> bool:
+        """Trip daily breaker on Gemini 429/resource-exhausted errors."""
+        msg = str(err).lower()
+        if "429" in msg or "resource_exhausted" in msg or "quota" in msg:
+            self._rate_limited_utc_date = datetime.utcnow().strftime("%Y-%m-%d")
+            logger.warning(
+                "[Gemini] Quota exhausted (429) — suspending Gemini calls until next UTC day"
+            )
+            return True
+        return False
 
     def _parse_ai_response(self, text: str, df: pd.DataFrame | None = None) -> PatternSignal:
         """Parse Gemini response into a PatternSignal.
@@ -512,6 +542,10 @@ Return ONLY a JSON object:
         if not self._model:
             return self._fallback_regime_analysis(df)
 
+        if self._is_rate_limited_today():
+            logger.debug("Gemini suspended for current UTC day due to prior 429")
+            return self._fallback_regime_analysis(df)
+
         # Cache check
         cache_key = self._make_cache_key("regime", pair_name, "", df)
         cached = self._get_cache(cache_key)
@@ -562,6 +596,8 @@ Risk multiplier guidelines:
                 return self._fallback_regime_analysis(df)
 
         except Exception as e:
+            if self._handle_rate_limit(e):
+                return self._fallback_regime_analysis(df)
             logger.error(f"AI regime analysis failed: {e}")
             return self._fallback_regime_analysis(df)
 
@@ -795,6 +831,10 @@ Risk multiplier guidelines:
             logger.info(f"[Gemini Eval] Cache hit: {pair_name} position evaluation")
             return cached
 
+        if self._is_rate_limited_today():
+            logger.debug("Gemini suspended for current UTC day due to prior 429")
+            return _hold
+
         try:
             image_bytes = self.generate_chart_image(df, pair_name, timeframe)
             if image_bytes is None:
@@ -846,6 +886,8 @@ Return ONLY a JSON object:
             return result
 
         except Exception as e:
+            if self._handle_rate_limit(e):
+                return _hold
             logger.error(f"[Gemini] evaluate_position failed: {e}")
             return _hold
 

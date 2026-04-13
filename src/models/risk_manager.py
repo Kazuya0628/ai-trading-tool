@@ -28,7 +28,8 @@ from src.strategies.strategy_engine import TradeSignal
 @dataclass
 class PositionSize:
     """Calculated position size with risk parameters."""
-    lots: float
+    units: int
+    lots: float  # kept for display/logging (units / 100000 for non-JPY, units / 100 for JPY)
     risk_amount: float
     stop_distance_pips: float
     pip_value: float
@@ -522,26 +523,30 @@ class RiskManager:
         signal: TradeSignal,
         account_balance: float,
         pip_value: float = 0.01,
+        broker: Any = None,
+        instrument: str = "",
     ) -> PositionSize:
         """Calculate position size based on risk parameters.
 
-        Risk per trade = account_balance * risk_pct / 100
-        Position size = risk_amount / (stop_distance * pip_value)
+        When broker is provided, uses OANDA API for accurate pip value
+        calculation and returns units directly. Falls back to legacy
+        formula when broker is not available (e.g., backtest).
 
         Args:
             signal: Trade signal with SL/TP levels.
             account_balance: Current account balance.
-            pip_value: Value per pip for the pair.
+            pip_value: Pip size for the pair (fallback only).
+            broker: OandaClient instance for API-based calculation.
+            instrument: OANDA instrument name (e.g., 'GBP_USD').
 
         Returns:
-            PositionSize with calculated lots.
+            PositionSize with calculated units and display lots.
         """
         # Phase 1: fixed risk, adaptive runs as shadow
         if self.phase == Phase.PHASE_1:
             adaptive_mult = self.adaptive.calculate_risk_multiplier(
                 self.state.current_drawdown_pct, phase=self.phase,
             )
-            # Shadow log only — actual risk is fixed
             shadow_risk = self.risk_per_trade_pct * adaptive_mult
             logger.debug(
                 f"[Phase1 Shadow] adaptive_mult={adaptive_mult:.2f} "
@@ -549,11 +554,9 @@ class RiskManager:
             )
             adjusted_risk_pct = self._phase1_fixed_risk_pct
         else:
-            # Phase 2+: adaptive risk is live
             adaptive_mult = self.adaptive.calculate_risk_multiplier(
                 self.state.current_drawdown_pct, phase=self.phase,
             )
-            # Apply signal quality multiplier (AI consensus-based dynamic sizing)
             quality_mult = self._signal_quality_multiplier(signal)
             adjusted_risk_pct = self.risk_per_trade_pct * adaptive_mult * quality_mult
 
@@ -567,32 +570,70 @@ class RiskManager:
                 f"→ risk={adjusted_risk_pct:.3f}%"
             )
 
-        # Calculate risk amount
+        # Calculate risk amount in account currency
         risk_amount = account_balance * adjusted_risk_pct / 100
 
-        # Calculate stop distance in pips
+        # Calculate stop distance
         stop_distance = abs(signal.entry_price - signal.stop_loss)
-        stop_distance_pips = stop_distance / pip_value
 
-        # Enforce min/max stop distance
-        stop_distance_pips = max(stop_distance_pips, self.min_sl_pips)
-        stop_distance_pips = min(stop_distance_pips, self.max_sl_pips)
+        # Use broker API for accurate unit calculation
+        if broker and instrument and hasattr(broker, 'calculate_units'):
+            pip_value_actual = broker.get_pip_value(instrument)
+            stop_distance_pips = stop_distance / pip_value_actual if pip_value_actual > 0 else 0
 
-        # Calculate lots
-        if stop_distance_pips > 0 and pip_value > 0:
-            lots = risk_amount / (stop_distance_pips * pip_value * 10000)
+            # Enforce min/max stop distance
+            stop_distance_pips = max(stop_distance_pips, self.min_sl_pips)
+            stop_distance_pips = min(stop_distance_pips, self.max_sl_pips)
+
+            # Recalculate stop distance after clamping
+            clamped_stop_distance = stop_distance_pips * pip_value_actual
+
+            units = broker.calculate_units(
+                instrument=instrument,
+                risk_amount_account=risk_amount,
+                stop_distance_price=clamped_stop_distance,
+            )
+
+            # Enforce max units from OANDA API (maximumOrderUnits)
+            if hasattr(broker, 'get_instrument_info'):
+                inst_info = broker.get_instrument_info(instrument)
+                max_units = int(inst_info.get("maximumOrderUnits", 100_000_000))
+            else:
+                max_units = 100_000_000  # Safe fallback (OANDA default)
+            units = min(units, max_units)
+            units = max(units, 1)
+
+            # Display lots (standard lot = 100,000 units for display only)
+            lots = units / 100_000
+
+            logger.info(
+                f"[PositionSize] {instrument}: risk=¥{risk_amount:,.0f} "
+                f"stop={stop_distance_pips:.1f}pips → {units:,} units "
+                f"({lots:.4f} std lots)"
+            )
         else:
-            lots = 0
+            # Fallback: legacy formula (backtest / no broker)
+            # pip_value is passed from caller (e.g. config or broker fallback)
+            stop_distance_pips = stop_distance / pip_value if pip_value > 0 else 0
+            stop_distance_pips = max(stop_distance_pips, self.min_sl_pips)
+            stop_distance_pips = min(stop_distance_pips, self.max_sl_pips)
 
-        # Enforce maximum
-        lots = min(lots, self.max_position_lots)
-        lots = max(lots, 0.01)  # Minimum lot size
-
-        # Round to 2 decimal places
-        lots = round(lots, 2)
+            if stop_distance_pips > 0 and pip_value > 0:
+                # risk_amount / (stop_pips * pip_value_per_unit)
+                # For backtest: approximate units directly
+                pip_value_per_unit = pip_value  # price movement per pip per 1 unit
+                units = int(risk_amount / (stop_distance_pips * pip_value_per_unit)) if (stop_distance_pips * pip_value_per_unit) > 0 else 0
+            else:
+                units = 0
+            units = max(units, 1)
+            # Apply max position size cap (lots-based)
+            max_units_from_lots = int(self.max_position_lots * 100_000)
+            units = min(units, max_units_from_lots)
+            lots = units / 100_000  # Display only
 
         return PositionSize(
-            lots=lots,
+            units=units,
+            lots=round(lots, 4),
             risk_amount=risk_amount,
             stop_distance_pips=stop_distance_pips,
             pip_value=pip_value,
@@ -656,6 +697,8 @@ class RiskManager:
         atr: float,
         pattern_sl: float = 0,
         pip_size: float | None = None,
+        broker: Any = None,
+        instrument: str = "",
     ) -> float:
         """Calculate stop-loss level (regime-adjusted, min/max enforced).
 
@@ -669,13 +712,18 @@ class RiskManager:
             entry_price: Entry price level.
             atr: Current ATR value.
             pattern_sl: Pattern-based stop-loss (structurally significant).
-            pip_size: Pip size (auto-derived from entry_price if omitted).
+            pip_size: Pip size (overrides broker lookup if provided).
+            broker: OandaClient for API-based pip value lookup.
+            instrument: OANDA instrument name.
 
         Returns:
             Stop-loss price level.
         """
-        # pip_size を価格幅から自動推定（JPY系は0.01、それ以外は0.0001）
+        # pip_size: prefer explicit > broker API > price-based heuristic
+        if pip_size is None and broker and instrument and hasattr(broker, 'get_pip_value'):
+            pip_size = broker.get_pip_value(instrument)
         if pip_size is None:
+            # Last resort fallback for backtest without broker
             pip_size = 0.01 if entry_price > 50 else 0.0001
 
         # 1. ATRベース（レジーム調整済み）
