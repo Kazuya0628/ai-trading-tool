@@ -17,12 +17,18 @@ from __future__ import annotations
 
 import time
 import traceback
-from datetime import datetime
+from datetime import datetime, date
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
 from loguru import logger
+
+try:
+    import jpholiday  # type: ignore
+    _JPHOLIDAY_AVAILABLE = True
+except ImportError:
+    _JPHOLIDAY_AVAILABLE = False
 
 from src.app.runtime_state import RuntimeState
 from src.app.scheduler import Scheduler
@@ -95,7 +101,10 @@ class TradingBot:
         self.strategy_engine = StrategyEngine(
             pattern_detector=self.pattern_detector,
             ai_analyzer=self.ai_analyzer,
-            config={"indicators": self.config.indicators},
+            config={
+                "indicators": self.config.indicators,
+                "consensus": self.config.consensus_config,
+            },
         )
 
         # --- Services (design doc: separated from orchestrator) ---
@@ -110,7 +119,10 @@ class TradingBot:
         self.gemini_budget = GeminiBudgetService(
             self.config.ai_analysis.get("budget", {})
         )
-        self.portfolio = PortfolioService()
+        _max_currency_exposure = self.config.risk_management.get(
+            "max_currency_exposure_count", 3
+        )
+        self.portfolio = PortfolioService(max_currency_exposure=_max_currency_exposure)
         self.reconciliation = ReconciliationService(self.broker, self.position_store)
 
         self.notifier = Notifier(
@@ -120,14 +132,6 @@ class TradingBot:
                 "channel_access_token": self.config.env.get("LINE_CHANNEL_ACCESS_TOKEN", ""),
                 "user_id": self.config.env.get("LINE_USER_ID", ""),
                 "imgbb_api_key": self.config.env.get("IMGBB_API_KEY", ""),
-            },
-            email_config={
-                "smtp_host": self.config.env.get("SMTP_HOST", ""),
-                "smtp_port": self.config.env.get("SMTP_PORT", "587"),
-                "smtp_user": self.config.env.get("SMTP_USER", ""),
-                "smtp_password": self.config.env.get("SMTP_PASSWORD", ""),
-                "from": self.config.env.get("EMAIL_FROM", ""),
-                "to": self.config.env.get("EMAIL_TO", ""),
             },
         )
 
@@ -149,10 +153,48 @@ class TradingBot:
         # Aliased from state for backward compat in existing methods
         self._gemini_cache: dict[str, dict[str, Any]] = self.state.gemini_cache
 
+        # Runtime tracking attributes
+        self._dd_warned_levels: set[float] = set()
+        self._prev_regime: str = ""
+        self._last_summary_date: str = ""
+        self._last_weekly_review_date: str = ""
+        self._position_eval_counter: int = 0
+
         self._restore_open_trades()
 
     def _restore_open_trades(self) -> None:
-        """Restore open positions from SQLite DB on startup."""
+        """Restore open positions on startup — OANDA API is source of truth."""
+        use_oanda = hasattr(self.broker, "_use_oanda_api") and self.broker._use_oanda_api
+
+        if use_oanda:
+            # OANDA mode: fetch live positions from API, enrich with local AI metadata
+            try:
+                oanda_positions = self.broker.get_positions()
+                for pos in oanda_positions:
+                    instrument = pos["instrument"]
+                    deal_id = pos["deal_id"]
+                    # Enrich with AI metadata (pattern, confidence, etc.) from SQLite
+                    meta = self.position_store.get_position_by_deal_id(deal_id) or {}
+                    if instrument not in self._open_trades:
+                        self._open_trades[instrument] = []
+                    self._open_trades[instrument].append({
+                        **pos,
+                        "opened_at": pos.get("open_time", ""),
+                        "pattern": meta.get("pattern", "UNKNOWN"),
+                        "confidence": meta.get("confidence", 0),
+                        "signal_id": meta.get("signal_id"),
+                        "is_fallback": bool(meta.get("is_fallback", False)),
+                    })
+                total = sum(len(v) for v in self._open_trades.values())
+                logger.info(
+                    f"Restored {total} open positions from OANDA API: "
+                    f"{list(self._open_trades.keys())}"
+                )
+            except Exception as e:
+                logger.error(f"Failed to restore positions from OANDA: {e}")
+            return
+
+        # Paper mode fallback: restore from SQLite
         try:
             positions = self.position_store.get_open_positions()
             if not positions:
@@ -190,7 +232,10 @@ class TradingBot:
             logger.error(f"Failed to restore positions from DB: {e}")
 
     def _has_open_position_in_log(self, instrument: str) -> bool:
-        """Check if a position is open for the given instrument."""
+        """Check if there is an open position for the given instrument."""
+        if hasattr(self.broker, "_use_oanda_api") and self.broker._use_oanda_api:
+            # OANDA mode: _open_trades is the in-memory mirror of OANDA state
+            return instrument in self._open_trades and bool(self._open_trades[instrument])
         return self.position_store.has_open_position(instrument)
 
     # --------------------------------------------------
@@ -263,7 +308,8 @@ class TradingBot:
         self.notifier.alert(
             f"Trading bot started.\n"
             f"Mode: {'LIVE' if self.config.is_live else 'PAPER'}\n"
-            f"Pairs: {', '.join(self.config.active_pairs)}"
+            f"Pairs: {', '.join(self.config.active_pairs)}",
+            line=False,
         )
 
         try:
@@ -374,6 +420,32 @@ class TradingBot:
             open_pos = self.position_store.get_open_positions()
             lines.append(f"保有中ポジション: {len(open_pos)}件")
 
+            # Groqレジーム情報を追加
+            regime = self.risk_manager.adaptive.market_regime
+            if regime and getattr(regime, "regime", None):
+                lines.append(f"\n📊 現在レジーム: {regime.regime}")
+                if getattr(regime, "reasoning", ""):
+                    lines.append(f"Groq判断: {regime.reasoning[:80]}")
+
+            # 翌日の高インパクト経済指標を追加（Groqニュース）
+            calendar = self._last_sentiment.get("economic_calendar", [])
+            high_impact = [e for e in calendar if str(e.get("impact", "")).upper() in ("HIGH", "★★★", "3")]
+            if high_impact:
+                lines.append("\n⚠️ 注目経済指標（今後48h）:")
+                for ev in high_impact[:4]:
+                    lines.append(
+                        f"  {ev.get('date', '')} {ev.get('time', '')} "
+                        f"[{ev.get('currency', '')}] {ev.get('event', '')}"
+                    )
+            elif calendar:
+                # 高インパクトがなければ直近3件のみ
+                lines.append("\n📅 経済指標（今後48h）:")
+                for ev in calendar[:3]:
+                    lines.append(
+                        f"  {ev.get('date', '')} {ev.get('time', '')} "
+                        f"[{ev.get('currency', '')}] {ev.get('event', '')}"
+                    )
+
             message = "\n".join(lines)
             logger.info(f"Sending daily summary for {date}")
             self.notifier.send("デイリーサマリー", message)
@@ -472,7 +544,7 @@ class TradingBot:
             if warn_text:
                 msg += f"\n{warn_text}"
 
-            self.notifier.send("週次戦略レビュー", msg)
+            self.notifier.send("週次戦略レビュー", msg, line=False)
 
         except Exception as e:
             logger.error(f"Weekly threshold review failed: {e}")
@@ -490,7 +562,7 @@ class TradingBot:
         Sends chart image + AI reasoning so the user can see what was analyzed.
         """
         primary_df = mtf_data.get("primary")
-        decimals = 3 if "JPY" in instrument else 5
+        decimals = self.broker._price_precision(instrument) if hasattr(self.broker, '_price_precision') else (3 if "JPY" in instrument else 5)
 
         best = signals[0]
         direction_emoji = "📈" if best.direction.value == "BUY" else "📉"
@@ -615,12 +687,42 @@ class TradingBot:
         self.broker.disconnect()
         logger.info("Trading bot stopped")
 
+    @staticmethod
+    def _is_market_closed(now: datetime | None = None) -> tuple[bool, str]:
+        """Check if the market should be treated as closed.
+
+        Returns (True, reason) when:
+        - Saturday or Sunday (FX market closed globally)
+        - Japanese public holiday (per user request)
+
+        Args:
+            now: Override current time (for testing). Defaults to datetime.now().
+
+        Returns:
+            Tuple of (is_closed, reason).
+        """
+        now = now or datetime.now()
+        weekday = now.weekday()  # 0=Mon, 6=Sun
+        if weekday == 5:
+            return True, "Saturday (FX market closed)"
+        if weekday == 6:
+            return True, "Sunday (FX market closed)"
+        if _JPHOLIDAY_AVAILABLE and jpholiday.is_holiday(now.date()):
+            holiday_name = jpholiday.is_holiday_name(now.date()) or "Japanese holiday"
+            return True, f"Japanese holiday ({holiday_name})"
+        return False, ""
+
     def _trading_cycle(self) -> None:
         """Execute one complete trading cycle (legacy entry point).
 
         Used by run_trade_once and backcompat. Delegates to Layer 0/1 via
         4H candle detection.
         """
+        closed, reason = self._is_market_closed()
+        if closed:
+            logger.info(f"Market closed: {reason} — skipping cycle")
+            return
+
         logger.info("-" * 40)
         logger.info(f"Trading cycle: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
@@ -853,7 +955,7 @@ class TradingBot:
         """
         pair_config = self.config.pair_configs.get(instrument, {})
         pair_name = pair_config.get("name", instrument)
-        pip_value = pair_config.get("pip_value", 0.01)
+        pip_value = self.broker.get_pip_value(instrument) if hasattr(self.broker, 'get_pip_value') else pair_config.get("pip_value", 0.01)
 
         logger.info(f"Analyzing {pair_name} ({instrument})...")
 
@@ -1127,6 +1229,8 @@ class TradingBot:
                 entry_price=best_signal.entry_price,
                 atr=atr,
                 pattern_sl=best_signal.stop_loss,
+                broker=self.broker,
+                instrument=instrument,
             )
             refined_tp = self.risk_manager.calculate_take_profit(
                 direction=best_signal.direction.value,
@@ -1140,6 +1244,8 @@ class TradingBot:
             signal=best_signal,
             account_balance=balance,
             pip_value=pip_value,
+            broker=self.broker,
+            instrument=instrument,
         )
 
         adaptive_mult = self.risk_manager.adaptive.calculate_risk_multiplier(
@@ -1150,7 +1256,7 @@ class TradingBot:
             f"Entry={best_signal.entry_price:.5f} | "
             f"SL={best_signal.stop_loss:.5f} | "
             f"TP={best_signal.take_profit:.5f} | "
-            f"Size={pos_size.lots:.2f} lots | "
+            f"Units={pos_size.units:,} ({pos_size.lots:.4f} std lots) | "
             f"Risk=¥{pos_size.risk_amount:,.0f} ({pos_size.risk_pct:.2f}%) | "
             f"R:R={best_signal.risk_reward_ratio:.1f} | "
             f"Adaptive×{adaptive_mult:.2f} | "
@@ -1211,7 +1317,7 @@ class TradingBot:
         result = self.broker.open_position(
             epic=instrument,
             direction=signal.direction.value,
-            size=pos_size.lots,
+            size=pos_size.units,
             order_type="MARKET",
             stop_loss=signal.stop_loss,
             take_profit=signal.take_profit,
@@ -1228,7 +1334,7 @@ class TradingBot:
                 "entry_price": result.get("level", signal.entry_price),
                 "stop_loss": signal.stop_loss,
                 "take_profit": signal.take_profit,
-                "size": pos_size.lots,
+                "size": pos_size.units,
                 "pattern": signal.pattern.value,
                 "opened_at": datetime.now().isoformat(),
             }
@@ -1243,7 +1349,7 @@ class TradingBot:
                 f"entry={signal.entry_price:.5f}|"
                 f"sl={signal.stop_loss:.5f}|"
                 f"tp={signal.take_profit:.5f}|"
-                f"size={pos_size.lots:.2f}|"
+                f"size={pos_size.units}|"
                 f"pattern={signal.pattern.value}"
             )
 
@@ -1254,7 +1360,7 @@ class TradingBot:
                 message=f"Pattern: {signal.pattern.value}",
                 fields={
                     "Entry Price": f"{signal.entry_price:.5f}",
-                    "Size": f"{pos_size.lots:.2f} lots",
+                    "Size": f"{pos_size.units:,} units",
                     "Stop Loss": f"{signal.stop_loss:.5f}",
                     "Take Profit": f"{signal.take_profit:.5f}",
                     "R:R": f"1:{rr:.1f}",
@@ -1269,24 +1375,42 @@ class TradingBot:
             )
 
     def _close_trade_info(self, instrument: str, trade_info: dict) -> None:
-        """Handle close processing for a single trade_info dict."""
-        pnl = self._estimate_closed_pnl(trade_info)
+        """Handle close processing for a single trade_info dict.
+
+        Uses OANDA actual realizedPL when connected to OANDA API.
+        Falls back to estimation only in paper mode.
+        """
+        deal_id = trade_info.get("deal_id", "")
+        pnl = 0.0
+        exit_price = 0.0
+
+        # OANDA API: fetch actual realizedPL and exit price
+        use_oanda = hasattr(self.broker, "_use_oanda_api") and self.broker._use_oanda_api
+        if use_oanda and deal_id:
+            closed = self.broker.get_closed_trade(deal_id)
+            if closed:
+                pnl = closed["realized_pl"]
+                exit_price = closed.get("exit_price", 0.0)
+
+        # Paper fallback: estimate from current market price
+        if exit_price == 0:
+            try:
+                price_info = self.data_manager.get_latest_price(instrument)
+                exit_price = price_info.get("mid", 0)
+            except Exception:
+                exit_price = 0
+        if not use_oanda:
+            pnl = self._estimate_closed_pnl_paper_only(trade_info, exit_price)
+
         self.risk_manager.record_trade_result(
             pnl=pnl,
             pattern=trade_info.get("pattern", ""),
             instrument=instrument,
         )
 
-        # Get exit price for logging
-        try:
-            price_info = self.data_manager.get_latest_price(instrument)
-            exit_price = price_info.get("mid", 0)
-        except Exception:
-            exit_price = 0
-
         pair_name = instrument.replace("_", "/")
         self.position_store.close_position(
-            deal_id=trade_info.get("deal_id", ""),
+            deal_id=deal_id,
             exit_price=exit_price,
             pnl=pnl,
         )
@@ -1297,7 +1421,7 @@ class TradingBot:
 
         log_trade(
             f"CLOSE|{pair_name}|"
-            f"deal={trade_info.get('deal_id', '')}|"
+            f"deal={deal_id}|"
             f"exit={exit_price:.5f}|"
             f"pnl={pnl:.2f}|"
             f"pattern={trade_info.get('pattern', '')}"
@@ -1305,7 +1429,7 @@ class TradingBot:
 
         logger.info(
             f"Position closed: {instrument} "
-            f"deal={trade_info.get('deal_id', 'N/A')} "
+            f"deal={deal_id or 'N/A'} "
             f"PnL=¥{pnl:+,.0f}"
         )
 
@@ -1321,7 +1445,7 @@ class TradingBot:
         # Pips 計算
         if exit_price and entry_p:
             direction_str = trade_info.get("direction", "")
-            pip_unit = 0.01 if "JPY" in instrument else 0.0001
+            pip_unit = self.broker.get_pip_value(instrument) if hasattr(self.broker, 'get_pip_value') else (0.01 if "JPY" in instrument else 0.0001)
             raw_diff = (exit_price - entry_p) if direction_str == "BUY" else (entry_p - exit_price)
             pips_val = raw_diff / pip_unit
         else:
@@ -1443,7 +1567,7 @@ class TradingBot:
             return
 
         from src.strategies.consensus_engine import ConsensusEngine
-        consensus_engine = ConsensusEngine()
+        consensus_engine = ConsensusEngine(self.config.consensus_config)
         current_regime = self.risk_manager.adaptive.market_regime.regime
 
         for instrument, positions_list in list(self._open_trades.items()):
@@ -1513,20 +1637,17 @@ class TradingBot:
                             f"[Layer2 Close] {instrument}: consensus close "
                             f"{consensus.summary} — closing position"
                         )
-                        pnl = self.broker.close_position(trade_info["deal_id"])
-                        if pnl is not None:
-                            if hasattr(self.broker, "apply_trade_pnl"):
-                                self.broker.apply_trade_pnl(pnl)
+                        close_result = self.broker.close_position(trade_info["deal_id"])
+                        close_success = (
+                            close_result.get("success", False)
+                            if isinstance(close_result, dict)
+                            else close_result is not None
+                        )
+                        if close_success:
+                            # _close_trade_info handles: record_trade_result,
+                            # position_store.close_position, apply_trade_pnl, log, notify
                             self._close_trade_info(instrument, trade_info)
                             positions_list.remove(trade_info)
-                            self.notifier.trade_closed(
-                                pair=pair_name,
-                                direction=pos_dir,
-                                entry=entry_price,
-                                exit_price=current_price,
-                                pnl=pnl,
-                                reason=f"AI consensus close ({consensus.summary})",
-                            )
                     else:
                         logger.debug(
                             f"[Layer2 Eval] {instrument}: HOLD — {consensus.summary}"
@@ -1603,15 +1724,13 @@ class TradingBot:
                     if atr == 0:
                         continue
 
-                    # pip_size を価格から推定（JPY系=0.01、それ以外=0.0001）
-                    pip_size = 0.01 if entry_price > 50 else 0.0001
-
                     # レジーム調整済みSL/TPを計算（min/max pip bounds 適用済み）
                     new_sl = self.risk_manager.calculate_stop_loss(
                         direction=direction,
                         entry_price=entry_price,
                         atr=atr,
-                        pip_size=pip_size,
+                        broker=self.broker,
+                        instrument=instrument,
                     )
                     new_tp = self.risk_manager.calculate_take_profit(
                         direction=direction,
@@ -1642,7 +1761,7 @@ class TradingBot:
                     )
 
                     pair_name = instrument.replace("_", "/")
-                    decimals = 3 if "JPY" in instrument else 5
+                    decimals = self.broker._price_precision(instrument) if hasattr(self.broker, '_price_precision') else (3 if "JPY" in instrument else 5)
 
                     logger.info(
                         f"[Regime調整] {pair_name} {direction} | "
@@ -1669,33 +1788,46 @@ class TradingBot:
                         f"[Regime調整] {instrument} の調整に失敗: {e}"
                     )
 
-    def _estimate_closed_pnl(self, trade_info: dict[str, Any]) -> float:
-        """Estimate P&L for a closed position.
+    def _estimate_closed_pnl_paper_only(
+        self, trade_info: dict[str, Any], exit_price: float
+    ) -> float:
+        """Estimate P&L for a closed position in paper trading mode.
 
-        Checks the broker for realized P&L, or estimates from current price.
+        PAPER MODE ONLY. When connected to OANDA, use get_closed_trade()
+        instead to get the actual realizedPL from the API.
+
+        P&L = price_diff × units (quote currency), then convert to JPY
+        if the quote currency is not JPY.
 
         Args:
             trade_info: Stored trade information.
+            exit_price: The exit price to use for the estimate.
 
         Returns:
-            Estimated profit/loss in account currency.
+            Estimated profit/loss in account currency (JPY).
         """
         try:
             instrument = trade_info.get("instrument", "")
-            price_info = self.data_manager.get_latest_price(instrument) if instrument else {}
-            current_price = price_info.get("mid", 0)
-
-            if current_price == 0:
-                return 0.0
-
             entry = trade_info.get("entry_price", 0)
             size = trade_info.get("size", 0)
             direction = trade_info.get("direction", "BUY")
 
+            if exit_price == 0 or entry == 0 or size == 0:
+                return 0.0
+
             if direction == "BUY":
-                pnl = (current_price - entry) * size * 10000
+                price_diff = exit_price - entry
             else:
-                pnl = (entry - current_price) * size * 10000
+                price_diff = entry - exit_price
+
+            # P&L in quote currency = price_diff × units
+            pnl = price_diff * size
+
+            # Convert to account currency (JPY) if quote is not JPY
+            parts = instrument.split("_")
+            quote_ccy = parts[1] if len(parts) == 2 else ""
+            if quote_ccy != "JPY" and hasattr(self.broker, "_get_conversion_rate"):
+                pnl *= self.broker._get_conversion_rate(quote_ccy, "JPY")
 
             return pnl
 
@@ -1775,7 +1907,7 @@ class TradingBot:
 
         # Run backtest
         pair_config = self.config.pair_configs.get(instrument, {})
-        pip_value = pair_config.get("pip_value", 0.01)
+        pip_value = self.broker.get_pip_value(instrument) if hasattr(self.broker, 'get_pip_value') else pair_config.get("pip_value", 0.01)
 
         bt_config = dict(self.config.backtesting)
         bt_config["adaptive"] = self.config.risk_management.get("adaptive", {})

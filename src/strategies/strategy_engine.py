@@ -114,7 +114,7 @@ class StrategyEngine:
         self.pattern_detector = pattern_detector
         self.ai_analyzer = ai_analyzer
         self.config = config or {}
-        self.consensus = ConsensusEngine()
+        self.consensus = ConsensusEngine(self.config.get("consensus"))
         self.last_ai_signal: Any | None = None  # 直近のGemini分析結果（ダッシュボード用）
 
     def analyze(

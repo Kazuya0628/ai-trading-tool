@@ -1,15 +1,12 @@
 """Notification system for trade alerts.
 
-Supports: Email (SMTP), Discord (Webhook), LINE Messaging API.
+Supports: Discord (Webhook), LINE Messaging API.
 """
 
 from __future__ import annotations
 
 import base64
-import smtplib
 from datetime import datetime
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
 from typing import Any
 
 import requests
@@ -17,14 +14,14 @@ from loguru import logger
 
 
 class Notifier:
-    """Send notifications for trade events via Email / Discord / LINE."""
+    """Send notifications for trade events via Discord / LINE."""
 
     def __init__(
         self,
         discord_webhook: str = "",
         line_token: str = "",
         line_config: dict[str, str] | None = None,
-        email_config: dict[str, Any] | None = None,
+        **_kwargs: Any,  # Accept and ignore legacy kwargs (e.g., email_config)
     ) -> None:
         self.discord_webhook = discord_webhook
         # Legacy LINE Notify (deprecated)
@@ -42,105 +39,35 @@ class Notifier:
         if self.line_enabled:
             logger.info(f"LINE Messaging API enabled: -> {self.line_user_id[:8]}...")
 
-        # Email configuration
-        self.email_config = email_config or {}
-        self.smtp_host = self.email_config.get("smtp_host", "")
-        self.smtp_port = int(self.email_config.get("smtp_port", 587))
-        self.smtp_user = self.email_config.get("smtp_user", "")
-        self.smtp_password = self.email_config.get("smtp_password", "")
-        self.email_from = self.email_config.get("from", self.smtp_user)
-        self.email_to = self.email_config.get("to", "")
-        self.email_enabled = bool(self.smtp_host and self.smtp_user and self.email_to)
+        # Circuit breakers for LINE and imgbb
+        self._line_suspended_until_month: str = ""
+        self._imgbb_failure_count: int = 0
+        self._imgbb_suspended: bool = False
 
-        if self.email_enabled:
-            logger.info(f"Email notifications enabled: -> {self.email_to}")
-
-    def send(self, title: str, message: str, fields: dict[str, Any] | None = None) -> None:
+    def send(
+        self,
+        title: str,
+        message: str,
+        fields: dict[str, Any] | None = None,
+        *,
+        line: bool = True,
+    ) -> None:
         """Send notification to all configured channels.
 
         Args:
             title: Notification title.
             message: Notification body.
             fields: Additional key-value data.
+            line: If False, skip LINE (use for high-frequency / low-priority events
+                  to stay within the monthly LINE message quota).
         """
-        if self.email_enabled:
-            self._send_email(title, message, fields)
         if self.discord_webhook:
             self._send_discord(title, message, fields)
-        if self.line_enabled:
-            self._send_line_messaging(title, message, fields)
-        elif self.line_token:
-            self._send_line_notify(title, message)
-
-    def _send_email(
-        self, title: str, message: str, fields: dict[str, Any] | None = None
-    ) -> None:
-        """Send email notification via SMTP.
-
-        Args:
-            title: Email subject suffix.
-            message: Email body text.
-            fields: Additional key-value data rendered as a table.
-        """
-        subject = f"[AI FX Bot] {title}"
-
-        # Build HTML body
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        fields_html = ""
-        if fields:
-            rows = "".join(
-                f'<tr><td style="padding:4px 12px;font-weight:bold;">{k}</td>'
-                f'<td style="padding:4px 12px;">{v}</td></tr>'
-                for k, v in fields.items()
-            )
-            fields_html = f'<table style="border-collapse:collapse;margin:12px 0;">{rows}</table>'
-
-        # Color based on direction
-        if "BUY" in title.upper():
-            color = "#22c55e"
-            direction_label = "BUY (Long)"
-        elif "SELL" in title.upper():
-            color = "#ef4444"
-            direction_label = "SELL (Short)"
-        else:
-            color = "#3b82f6"
-            direction_label = ""
-
-        html = f"""
-        <div style="font-family:Arial,sans-serif;max-width:500px;">
-            <div style="background:{color};color:white;padding:12px 16px;border-radius:8px 8px 0 0;">
-                <h2 style="margin:0;font-size:18px;">{title}</h2>
-            </div>
-            <div style="border:1px solid #e5e7eb;border-top:none;padding:16px;border-radius:0 0 8px 8px;">
-                <p style="margin:0 0 8px 0;">{message}</p>
-                {fields_html}
-                <p style="color:#9ca3af;font-size:12px;margin:12px 0 0 0;">{timestamp}</p>
-            </div>
-        </div>
-        """
-
-        # Plain text fallback
-        fields_text = ""
-        if fields:
-            fields_text = "\n".join(f"  {k}: {v}" for k, v in fields.items())
-
-        plain = f"{title}\n\n{message}\n\n{fields_text}\n\n{timestamp}"
-
-        msg = MIMEMultipart("alternative")
-        msg["Subject"] = subject
-        msg["From"] = self.email_from
-        msg["To"] = self.email_to
-        msg.attach(MIMEText(plain, "plain"))
-        msg.attach(MIMEText(html, "html"))
-
-        try:
-            with smtplib.SMTP(self.smtp_host, self.smtp_port, timeout=15) as server:
-                server.starttls()
-                server.login(self.smtp_user, self.smtp_password)
-                server.sendmail(self.email_from, self.email_to.split(","), msg.as_string())
-            logger.info(f"Email sent: {subject}")
-        except Exception as e:
-            logger.error(f"Email notification failed: {e}")
+        if line:
+            if self.line_enabled:
+                self._send_line_messaging(title, message, fields)
+            elif self.line_token:
+                self._send_line_notify(title, message)
 
     def _send_discord(self, title: str, message: str, fields: dict[str, Any] | None = None) -> None:
         """Send Discord webhook notification."""
@@ -170,6 +97,10 @@ class Notifier:
         self, title: str, message: str, fields: dict[str, Any] | None = None
     ) -> None:
         """Send notification via LINE Messaging API (Push Message)."""
+        if self._line_quota_exhausted():
+            logger.debug(f"LINE suspended (quota): skipping '{title}'")
+            return
+
         # Build message text
         text = f"[AI FX Bot] {title}\n{message}"
         if fields:
@@ -189,6 +120,9 @@ class Notifier:
                 json=payload,
                 timeout=10,
             )
+            if resp.status_code == 429:
+                self._suspend_line_for_month()
+                return
             resp.raise_for_status()
             logger.info(f"LINE message sent: {title}")
         except Exception as e:
@@ -203,7 +137,7 @@ class Notifier:
         Returns:
             Public HTTPS URL or None on failure.
         """
-        if not self.imgbb_api_key:
+        if not self.imgbb_api_key or self._imgbb_suspended:
             return None
 
         try:
@@ -217,14 +151,39 @@ class Notifier:
                 },
                 timeout=15,
             )
+            if resp.status_code == 400:
+                # imgbb returns 400 for both invalid key AND rate limit.
+                # Only suspend for invalid key — rate limit auto-recovers.
+                try:
+                    body = resp.json()
+                    err_msg = body.get("error", {}).get("message", "")
+                except Exception:
+                    err_msg = resp.text[:200]
+                if "rate limit" in err_msg.lower():
+                    logger.warning(f"imgbb rate limit (will retry next cycle): {err_msg}")
+                    return None
+                self._imgbb_suspended = True
+                logger.error(
+                    f"imgbb 400 (invalid API key?), suspending: {err_msg}. "
+                    f"Update IMGBB_API_KEY in .env and restart."
+                )
+                return None
             resp.raise_for_status()
             data = resp.json()
             url = data.get("data", {}).get("url", "")
             if url:
+                self._imgbb_failure_count = 0
                 logger.info(f"Image uploaded to imgbb: {url[:60]}...")
             return url or None
         except Exception as e:
-            logger.error(f"imgbb upload failed: {e}")
+            self._imgbb_failure_count += 1
+            if self._imgbb_failure_count >= 3:
+                self._imgbb_suspended = True
+                logger.error(
+                    f"imgbb failed {self._imgbb_failure_count} times, suspending: {e}"
+                )
+            else:
+                logger.error(f"imgbb upload failed: {e}")
             return None
 
     def send_with_chart(
@@ -234,6 +193,8 @@ class Notifier:
         fields: dict[str, Any] | None = None,
         chart_image: bytes | None = None,
         gemini_response: str = "",
+        *,
+        line: bool = True,
     ) -> None:
         """Send notification with chart image and Gemini analysis.
 
@@ -246,22 +207,30 @@ class Notifier:
             fields: Additional key-value data.
             chart_image: PNG chart image bytes.
             gemini_response: Raw Gemini analysis text.
+            line: If False, skip LINE.
         """
-        # Email always gets text (image as attachment is complex, skip for now)
-        if self.email_enabled:
-            full_msg = message
-            if gemini_response:
-                full_msg += f"\n\nGemini Analysis:\n{gemini_response[:500]}"
-            self._send_email(title, full_msg, fields)
-
         if self.discord_webhook:
             self._send_discord(title, message, fields)
 
         # LINE: send image + analysis text as a single push (counts as 1 message)
-        if self.line_enabled:
-            self._send_line_with_chart(title, message, fields, chart_image, gemini_response)
-        elif self.line_token:
-            self._send_line_notify(title, message)
+        if line:
+            if self.line_enabled:
+                self._send_line_with_chart(title, message, fields, chart_image, gemini_response)
+            elif self.line_token:
+                self._send_line_notify(title, message)
+
+    def _line_quota_exhausted(self) -> bool:
+        """Check whether LINE is suspended for the current month due to 429."""
+        current_month = datetime.now().strftime("%Y-%m")
+        return self._line_suspended_until_month == current_month
+
+    def _suspend_line_for_month(self) -> None:
+        """Mark LINE as suspended for the current calendar month."""
+        self._line_suspended_until_month = datetime.now().strftime("%Y-%m")
+        logger.warning(
+            f"LINE quota exhausted — suspending LINE notifications until next month "
+            f"({self._line_suspended_until_month})"
+        )
 
     def _send_line_with_chart(
         self,
@@ -276,6 +245,10 @@ class Notifier:
         Uses a single push with multiple messages (image + text).
         LINE counts this as 1 message toward the monthly quota.
         """
+        if self._line_quota_exhausted():
+            logger.debug(f"LINE suspended (quota): skipping '{title}'")
+            return
+
         messages = []
 
         # Upload and add image if available
@@ -313,6 +286,9 @@ class Notifier:
                 json=payload,
                 timeout=15,
             )
+            if resp.status_code == 429:
+                self._suspend_line_for_month()
+                return
             resp.raise_for_status()
             logger.info(f"LINE message+chart sent: {title}")
         except Exception as e:
@@ -320,6 +296,10 @@ class Notifier:
 
     def _send_line_notify(self, title: str, message: str) -> None:
         """Send LINE Notify notification (deprecated, legacy support)."""
+        if self._line_quota_exhausted():
+            logger.debug(f"LINE suspended (quota): skipping '{title}'")
+            return
+
         try:
             resp = requests.post(
                 "https://notify-api.line.me/api/notify",
@@ -327,6 +307,9 @@ class Notifier:
                 data={"message": f"\n{title}\n{message}"},
                 timeout=10,
             )
+            if resp.status_code == 429:
+                self._suspend_line_for_month()
+                return
             resp.raise_for_status()
         except Exception as e:
             logger.error(f"LINE Notify failed: {e}")
@@ -358,6 +341,7 @@ class Notifier:
         opened_at: str = "",
         pattern: str = "",
         risk_reward: float = 0.0,
+        decimals: int | None = None,
     ) -> None:
         """Notify about a trade closing."""
         from datetime import datetime
@@ -377,7 +361,8 @@ class Notifier:
             except ValueError:
                 hold_str = ""
 
-        decimals = 3 if "JPY" in pair else 5
+        if decimals is None:
+            decimals = 3 if entry_price > 50 else 5
         fields: dict[str, Any] = {}
         if entry_price:
             fields["Entry"] = f"{entry_price:.{decimals}f}"
@@ -420,7 +405,7 @@ class Notifier:
         risk_multiplier: float,
         reasoning: str,
     ) -> None:
-        """相場レジーム変化通知。"""
+        """相場レジーム変化通知。LINEはスキップ（頻度が高いためメール/Discordのみ）。"""
         self.send(
             title=f"📊 レジーム変化: {pair}",
             message=f"{old_regime} → {new_regime}",
@@ -430,6 +415,7 @@ class Notifier:
                 "リスク倍率": f"×{risk_multiplier:.2f}",
                 "判断理由": reasoning[:80] if reasoning else "-",
             },
+            line=False,
         )
 
     def monthly_oos_result(self, result_text: str) -> None:
@@ -440,9 +426,10 @@ class Notifier:
         )
 
     def sl_updated(self, pair: str, direction: str, old_sl: float, new_sl: float,
-                   entry: float) -> None:
-        """Notify about a trailing stop update."""
-        decimals = 3 if "JPY" in pair else 5
+                   entry: float, decimals: int | None = None) -> None:
+        """Notify about a trailing stop update. LINEはスキップ（5分毎に発火するため）。"""
+        if decimals is None:
+            decimals = 3 if entry > 50 else 5
         self.send(
             title=f"SL Updated: {pair}",
             message=f"{direction} position trailing stop moved",
@@ -451,12 +438,14 @@ class Notifier:
                 "Old SL": f"{old_sl:.{decimals}f}",
                 "New SL": f"{new_sl:.{decimals}f}",
             },
+            line=False,
         )
 
     def tp_updated(self, pair: str, direction: str, old_tp: float, new_tp: float,
-                   entry: float) -> None:
-        """Notify about a take profit update."""
-        decimals = 3 if "JPY" in pair else 5
+                   entry: float, decimals: int | None = None) -> None:
+        """Notify about a take profit update. LINEはスキップ（頻度が高いため）。"""
+        if decimals is None:
+            decimals = 3 if entry > 50 else 5
         self.send(
             title=f"TP Updated: {pair}",
             message=f"{direction} position take profit changed",
@@ -465,11 +454,12 @@ class Notifier:
                 "Old TP": f"{old_tp:.{decimals}f}",
                 "New TP": f"{new_tp:.{decimals}f}",
             },
+            line=False,
         )
 
-    def alert(self, message: str) -> None:
+    def alert(self, message: str, *, line: bool = True) -> None:
         """Send a general alert."""
-        self.send(title="ALERT", message=message)
+        self.send(title="ALERT", message=message, line=line)
 
     def daily_summary(self, summary: dict[str, Any]) -> None:
         """Send daily performance summary.

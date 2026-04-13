@@ -51,12 +51,42 @@ class ReconciliationService:
             report["db_positions"] = len(db_positions)
             db_by_deal = {p.get("deal_id", ""): p for p in db_positions}
 
-            # 2. Broker open trades
-            broker_positions = self.broker.get_positions()
-            if isinstance(broker_positions, list):
-                broker_trades = broker_positions
+            # 2. Broker open trades (OANDA returns DataFrame)
+            broker_df = self.broker.get_open_positions()
+            if hasattr(broker_df, 'empty') and not broker_df.empty:
+                broker_trades = broker_df.to_dict('records')
+                # Normalize OANDA column names to internal names
+                for t in broker_trades:
+                    if "dealId" in t and "deal_id" not in t:
+                        t["deal_id"] = t["dealId"]
+                    if "epic" in t and "instrument" not in t:
+                        t["instrument"] = t["epic"]
+                    if "level" in t and "entry_price" not in t:
+                        t["entry_price"] = t["level"]
+                    if "stopLevel" in t and "stop_loss" not in t:
+                        t["stop_loss"] = t.get("stopLevel") or 0
+                    if "limitLevel" in t and "take_profit" not in t:
+                        t["take_profit"] = t.get("limitLevel") or 0
+                    if "openedAt" in t and "opened_at" not in t:
+                        t["opened_at"] = t["openedAt"]
+            elif isinstance(broker_df, list):
+                broker_trades = broker_df
             else:
                 broker_trades = []
+
+            # Safety: if broker returned 0 trades but DB has positions,
+            # the broker connection likely failed — abort reconciliation
+            # to prevent falsely closing all DB positions.
+            if len(broker_trades) == 0 and len(db_positions) > 0:
+                connected = getattr(self.broker, '_connected', None)
+                if connected is False or connected is None:
+                    logger.warning(
+                        "[Reconciliation] Broker not connected — skipping "
+                        f"(DB has {len(db_positions)} positions, would wrongly close all)"
+                    )
+                    report["errors"].append("Broker not connected, skipped reconciliation")
+                    return report
+
             report["broker_positions"] = len(broker_trades)
             broker_by_deal = {t.get("deal_id", ""): t for t in broker_trades}
 
@@ -83,7 +113,6 @@ class ReconciliationService:
                             deal_id=deal_id,
                             exit_price=0,
                             pnl=0,
-                            exit_reason="reconciliation_closed",
                         )
                         report["db_only_closed"] += 1
                     except Exception as e:

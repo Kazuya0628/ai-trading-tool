@@ -61,13 +61,6 @@ def load_env() -> dict[str, str]:
         "LINE_CHANNEL_ACCESS_TOKEN": os.getenv("LINE_CHANNEL_ACCESS_TOKEN", ""),
         "LINE_USER_ID": os.getenv("LINE_USER_ID", ""),
         "IMGBB_API_KEY": os.getenv("IMGBB_API_KEY", ""),
-        # Email (SMTP)
-        "SMTP_HOST": os.getenv("SMTP_HOST", ""),
-        "SMTP_PORT": os.getenv("SMTP_PORT", "587"),
-        "SMTP_USER": os.getenv("SMTP_USER", ""),
-        "SMTP_PASSWORD": os.getenv("SMTP_PASSWORD", ""),
-        "EMAIL_FROM": os.getenv("EMAIL_FROM", ""),
-        "EMAIL_TO": os.getenv("EMAIL_TO", ""),
     }
 
     # Validate critical keys based on data source
@@ -186,3 +179,94 @@ class TradingConfig:
         lo = int(rm.get("confidence_threshold_min", 50))
         hi = int(rm.get("confidence_threshold_max", 65))
         rm["confidence_threshold"] = max(lo, min(hi, value))
+
+    # --------------------------------------------------
+    # DESIGN-001 v1.3 new config sections
+    # --------------------------------------------------
+
+    @property
+    def app(self) -> dict[str, Any]:
+        """Application-level settings (mode, phase, timezone)."""
+        return self.config.get("app", {})
+
+    @property
+    def phase(self) -> int:
+        """Current operational phase (1/2/3)."""
+        return int(self.app.get("phase", 1))
+
+    @property
+    def account_currency(self) -> str:
+        return self.app.get("account_currency", "JPY")
+
+    @property
+    def broker_config(self) -> dict[str, Any]:
+        """Broker provider settings."""
+        return self.config.get("broker", {})
+
+    @property
+    def data_config(self) -> dict[str, Any]:
+        """Data source and warmup settings."""
+        return self.config.get("data", {})
+
+    @property
+    def pairs_config(self) -> dict[str, Any]:
+        """New-format pairs section (active/registered lists)."""
+        return self.config.get("pairs", {})
+
+    @property
+    def active_pairs_v2(self) -> list[str]:
+        """Active pairs from new config format, fallback to legacy."""
+        pairs_new = self.pairs_config.get("active", [])
+        if pairs_new:
+            return pairs_new
+        return self.active_pairs  # fallback to legacy
+
+    @property
+    def scheduler_config(self) -> dict[str, Any]:
+        """Scheduler layer 0/1/2 timing settings."""
+        return self.config.get("scheduler", {})
+
+    @property
+    def strategy_config(self) -> dict[str, Any]:
+        """Strategy settings (pattern_score_min, structural_rr_min)."""
+        return self.config.get("strategy", {})
+
+    @property
+    def ai_config(self) -> dict[str, Any]:
+        """AI configuration (gemini + groq sections)."""
+        return self.config.get("ai", {})
+
+    @property
+    def gemini_config(self) -> dict[str, Any]:
+        """Gemini AI settings."""
+        return self.ai_config.get("gemini", {})
+
+    @property
+    def groq_config(self) -> dict[str, Any]:
+        """Groq AI settings."""
+        return self.ai_config.get("groq", {})
+
+    @property
+    def consensus_config(self) -> dict[str, Any]:
+        """Consensus engine thresholds."""
+        return self.config.get("consensus", {})
+
+    @property
+    def execution_config(self) -> dict[str, Any]:
+        """Execution settings (slippage, expiry, spread)."""
+        return self.config.get("execution", {})
+
+    @property
+    def portfolio_config(self) -> dict[str, Any]:
+        """Portfolio settings (NAV anchors)."""
+        return self.config.get("portfolio", {})
+
+    @property
+    def dashboard_config(self) -> dict[str, Any]:
+        """Dashboard settings (host, port, refresh)."""
+        return self.config.get("dashboard", {})
+
+    @property
+    def notifications_config(self) -> dict[str, Any]:
+        """Notification settings."""
+        return self.config.get("notifications", {})

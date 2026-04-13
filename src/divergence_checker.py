@@ -5,7 +5,7 @@ and alerts when metrics diverge beyond acceptable thresholds.
 
 Usage:
     python src/divergence_checker.py                  # Check and display
-    python src/divergence_checker.py --email           # Check and send email report
+    python src/divergence_checker.py --notify          # Check and send Discord/LINE notification
     python src/divergence_checker.py --json            # Output JSON
 """
 
@@ -445,7 +445,7 @@ def _status_icon(forward_val: float, backtest_val: float,
         return "CRIT"
 
 
-def run_check(log_path: str = "logs/trades.log", send_email: bool = False) -> dict[str, Any]:
+def run_check(log_path: str = "logs/trades.log", send_notification: bool = False) -> dict[str, Any]:
     """Run the full divergence check.
 
     Returns:
@@ -469,9 +469,9 @@ def run_check(log_path: str = "logs/trades.log", send_email: bool = False) -> di
 
     report = generate_report(all_metrics, all_alerts)
 
-    # Send email if requested
-    if send_email:
-        _send_email_report(report, all_alerts)
+    # Send notification if requested
+    if send_notification:
+        _send_notification_report(report, all_alerts)
 
     return {
         "metrics": {inst: {
@@ -495,24 +495,22 @@ def run_check(log_path: str = "logs/trades.log", send_email: bool = False) -> di
     }
 
 
-def _send_email_report(report: str, all_alerts: dict[str, list[DivergenceAlert]]) -> None:
-    """Send divergence report via email."""
+def _send_notification_report(report: str, all_alerts: dict[str, list[DivergenceAlert]]) -> None:
+    """Send divergence report via Discord / LINE."""
     import os
     from dotenv import load_dotenv
     load_dotenv()
 
     from src.utils.notifier import Notifier
 
-    email_config = {
-        "smtp_host": os.getenv("SMTP_HOST", ""),
-        "smtp_port": os.getenv("SMTP_PORT", "587"),
-        "smtp_user": os.getenv("SMTP_USER", ""),
-        "smtp_password": os.getenv("SMTP_PASSWORD", ""),
-        "from": os.getenv("EMAIL_FROM", ""),
-        "to": os.getenv("EMAIL_TO", ""),
-    }
-
-    notifier = Notifier(email_config=email_config)
+    notifier = Notifier(
+        discord_webhook=os.getenv("DISCORD_WEBHOOK_URL", ""),
+        line_config={
+            "channel_access_token": os.getenv("LINE_CHANNEL_ACCESS_TOKEN", ""),
+            "user_id": os.getenv("LINE_USER_ID", ""),
+            "imgbb_api_key": os.getenv("IMGBB_API_KEY", ""),
+        },
+    )
 
     critical = sum(1 for alerts in all_alerts.values() for a in alerts if a.severity == "CRITICAL")
     warning = sum(1 for alerts in all_alerts.values() for a in alerts if a.severity == "WARNING")
@@ -533,11 +531,11 @@ def main() -> None:
 
     parser = argparse.ArgumentParser(description="Forward vs Backtest Divergence Checker")
     parser.add_argument("--log", default="logs/trades.log", help="Trade log path")
-    parser.add_argument("--email", action="store_true", help="Send report via email")
+    parser.add_argument("--notify", action="store_true", help="Send report via Discord/LINE")
     parser.add_argument("--json", action="store_true", help="Output as JSON")
     args = parser.parse_args()
 
-    result = run_check(log_path=args.log, send_email=args.email)
+    result = run_check(log_path=args.log, send_notification=args.notify)
 
     if args.json:
         # Remove report from JSON output (too long)

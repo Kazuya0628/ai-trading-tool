@@ -10,6 +10,7 @@ Lightweight Flask app displaying:
 from __future__ import annotations
 
 import json
+import socket
 import sys
 import threading
 import time
@@ -378,7 +379,7 @@ DASHBOARD_HTML = """
         <table class="positions-table">
             <thead>
                 <tr>
-                    <th>Pair</th><th>Direction</th><th>Lots</th><th>Entry</th>
+                    <th>Pair</th><th>Direction</th><th>Units</th><th>Entry</th>
                     <th>Current</th><th>SL</th><th>TP</th><th>P&L (pips)</th><th>P&L (¥)</th><th>Pattern</th>
                     <th>保有時刻</th><th>経過</th>
                 </tr>
@@ -572,7 +573,7 @@ DASHBOARD_HTML = """
                         // 保有時刻は月/日 時:分 表示
                         const openedLabel = p.opened_at ? p.opened_at.slice(5, 16) : '-';
                         return `
-                        <tr data-instrument="${p.instrument}" data-entry="${p.entry_raw}" data-direction="${p.direction}" data-size="${p.size_raw}">
+                        <tr data-instrument="${p.instrument}">
                             <td>${p.pair}</td>
                             <td><span class="${p.direction === 'BUY' ? 'buy-badge' : 'sell-badge'}">${p.direction}</span></td>
                             <td>${p.lots}</td>
@@ -839,27 +840,6 @@ DASHBOARD_HTML = """
                     priceEl.className = 'price ' + (mid >= prev ? 'price-up' : 'price-down');
                     priceEl.dataset.prev = mid;
 
-                    // ポジションの損益リアルタイム更新
-                    const rows = document.querySelectorAll(`[data-instrument="${instrument}"]`);
-                    rows.forEach(row => {
-                        const entry = parseFloat(row.dataset.entry || 0);
-                        const direction = row.dataset.direction;
-                        const size = parseFloat(row.dataset.size || 0);
-                        if (!entry || !direction) return;
-                        const diff = direction === 'BUY' ? mid - entry : entry - mid;
-                        const pips = diff * (isJpy ? 100 : 10000);
-                        const pnlAmt = diff * size * (isJpy ? 100 : 10000);
-                        const pipsEl = row.querySelector('.pips-cell');
-                        const pnlEl = row.querySelector('.pnl-cell');
-                        if (pipsEl) {
-                            pipsEl.textContent = (pips >= 0 ? '+' : '') + pips.toFixed(1) + ' pips';
-                            pipsEl.style.color = pips >= 0 ? '#22c55e' : '#ef4444';
-                        }
-                        if (pnlEl) {
-                            pnlEl.textContent = '¥' + (pnlAmt >= 0 ? '+' : '') + pnlAmt.toLocaleString('ja-JP', {maximumFractionDigits: 0});
-                            pnlEl.style.color = pnlAmt >= 0 ? '#22c55e' : '#ef4444';
-                        }
-                    });
                 }
             } catch (e) { /* ストリーム未接続時は無視 */ }
         }
@@ -1004,20 +984,10 @@ def api_data() -> Any:
                 "position": pos_data,
             })
 
-        # Build positions list for table
-        # OANDAから直接ポジションのunrealizedPLを取得（deal_id→uPLマップ）
-        oanda_upl_map: dict[str, float] = {}
-        try:
-            oanda_positions = broker.get_open_positions()
-            if not oanda_positions.empty and "dealId" in oanda_positions.columns:
-                for _, row in oanda_positions.iterrows():
-                    oanda_upl_map[row["dealId"]] = float(row.get("unrealizedPL", 0))
-        except Exception:
-            pass
-
         # OANDA APIから取得した口座全体の未実現損益を使用
         total_unrealized = float(account.get("unrealized_pl", account.get("profit_loss", 0)))
 
+        # Build positions list for table
         positions_table = []
         for p in positions:
             instrument = p.get("instrument", "")
@@ -1030,26 +1000,20 @@ def api_data() -> Any:
             entry = p.get("entry", 0)
             direction = p.get("direction", "BUY")
             size = p.get("size", 0)
-            is_jpy = "JPY" in instrument
-            decimals = 3 if is_jpy else 5
+            decimals = broker._price_precision(instrument) if hasattr(broker, '_price_precision') else (3 if "JPY" in instrument else 5)
+            pip_size_val = broker.get_pip_value(instrument) if hasattr(broker, 'get_pip_value') else (0.01 if "JPY" in instrument else 0.0001)
 
-            # OANDAのunrealizedPLを優先、なければ概算
-            deal_id = p.get("deal_id", "")
-            oanda_pnl = oanda_upl_map.get(deal_id)
-            if oanda_pnl is not None:
-                pnl_amount = oanda_pnl
-            else:
-                pnl_diff = (current_price - entry) if direction == "BUY" else (entry - current_price)
-                pnl_amount = pnl_diff * size * (100 if is_jpy else 10000)
+            # OANDAのunrealizedPLをそのまま使用（APIが権威データ）
+            pnl_amount = float(p.get("unrealized_pl", 0))
 
             pnl_diff_for_pips = (current_price - entry) if direction == "BUY" else (entry - current_price)
-            pnl_pips = pnl_diff_for_pips * (100 if is_jpy else 10000)
+            pnl_pips = pnl_diff_for_pips / pip_size_val if pip_size_val else 0
 
             positions_table.append({
                 "pair": pair_config.get("name", instrument),
                 "instrument": instrument,
                 "direction": direction,
-                "lots": f"{size:.2f}",
+                "lots": f"{size:,.0f}",
                 "entry": f"{entry:.{decimals}f}",
                 "entry_raw": entry,
                 "size_raw": size,
@@ -1150,75 +1114,129 @@ def api_ai_log() -> Any:
 
 
 def _get_positions() -> list[dict]:
-    """Read open positions from trade log, then overlay SL/TP from SQLite.
+    """Get open positions — OANDA is truth source, trade log is fallback.
 
-    Log format: '2026-03-20 08:39:19.288 | OPEN|USD/JPY|SELL|deal=...|entry=...|sl=...|tp=...|size=...|pattern=...'
-    SQLite (data/positions.db) holds the latest SL/TP after --fix-sltp or regime adjustments.
+    Strategy:
+    1. Try OANDA API first (authoritative)
+    2. Fall back to trade log parsing if OANDA unavailable
+    3. Overlay SL/TP from SQLite for both sources
     """
-    trade_log = Path("logs/trades.log")
-    if not trade_log.exists():
-        logger.warning("No trade log found at logs/trades.log")
-        return []
-
-    # deal_id をキーにして複数ポジションを正しく管理
-    # CLOSE はインラインで即時除去（deal_id再利用に対応）
     positions: dict[str, dict] = {}
-    try:
-        with open(trade_log) as f:
-            for line in f:
-                if " | " not in line:
-                    continue
-                _, _, trade_part = line.partition(" | ")
-                trade_part = trade_part.strip()
 
-                if trade_part.startswith("OPEN|"):
-                    parts = trade_part.split("|")
-                    if len(parts) >= 7:
-                        pair_name = parts[1]
-                        direction = parts[2]
+    # 1. Try OANDA API first (truth source)
+    oanda_ok = False
+    try:
+        if broker:
+            broker_df = broker.get_open_positions()
+            if hasattr(broker_df, 'empty') and not broker_df.empty:
+                oanda_ok = True
+                for _, row in broker_df.iterrows():
+                    deal_id = row.get("dealId", "")
+                    if not deal_id:
+                        continue
+                    instrument = row.get("epic", "")
+                    positions[deal_id] = {
+                        "deal_id": deal_id,
+                        "instrument": instrument,
+                        "direction": row.get("direction", "BUY"),
+                        "entry": float(row.get("level", 0)),
+                        "sl": float(row.get("stopLevel", 0) or 0),
+                        "tp": float(row.get("limitLevel", 0) or 0),
+                        "size": float(row.get("size", 0)),
+                        "unrealized_pl": float(row.get("unrealizedPL", 0)),
+                        "pattern": "",
+                        "opened_at": str(row.get("openedAt", ""))[:16],
+                    }
+                logger.info(f"Positions from OANDA: {list(positions.keys())}")
+    except Exception as e:
+        logger.warning(f"OANDA position fetch failed, falling back to log: {e}")
+
+    # 2. Fall back to trade log if OANDA returned nothing
+    if not oanda_ok:
+        trade_log = Path("logs/trades.log")
+        if trade_log.exists():
+            try:
+                with open(trade_log) as f:
+                    for line in f:
+                        if " | " not in line:
+                            continue
+                        _, _, trade_part = line.partition(" | ")
+                        trade_part = trade_part.strip()
+
+                        if trade_part.startswith("OPEN|"):
+                            parts = trade_part.split("|")
+                            if len(parts) >= 7:
+                                pair_name = parts[1]
+                                direction = parts[2]
+                                fields = {}
+                                for p in parts[3:]:
+                                    if "=" in p:
+                                        k, v = p.split("=", 1)
+                                        fields[k] = v
+
+                                ts_raw = line.split(" | ")[0].strip()
+                                opened_at = ts_raw[:16]
+                                instrument = pair_name.replace("/", "_")
+                                deal_id = fields.get("deal", instrument)
+
+                                positions[deal_id] = {
+                                    "deal_id": deal_id,
+                                    "instrument": instrument,
+                                    "direction": direction,
+                                    "entry": float(fields.get("entry", 0)),
+                                    "sl": float(fields.get("sl", 0)),
+                                    "tp": float(fields.get("tp", 0)),
+                                    "size": float(fields.get("size", 0)),
+                                    "pattern": fields.get("pattern", ""),
+                                    "opened_at": opened_at,
+                                }
+
+                        elif trade_part.startswith("CLOSE|"):
+                            parts = trade_part.split("|")
+                            fields = {}
+                            for p in parts[2:]:
+                                if "=" in p:
+                                    k, v = p.split("=", 1)
+                                    fields[k] = v
+                            deal_id = fields.get("deal")
+                            if deal_id:
+                                positions.pop(deal_id, None)
+                            elif len(parts) >= 2:
+                                inst = parts[1].replace("/", "_")
+                                for did in [d for d, p in positions.items() if p["instrument"] == inst]:
+                                    positions.pop(did, None)
+
+            except Exception as e:
+                logger.error(f"Error reading trade log: {e}")
+            logger.info(f"Positions from log: {list(positions.keys())}")
+
+    # 3. Enrich with pattern info from trade log (for OANDA-sourced positions)
+    if oanda_ok:
+        trade_log = Path("logs/trades.log")
+        if trade_log.exists():
+            try:
+                # Build deal_id -> pattern map from log
+                log_patterns: dict[str, str] = {}
+                with open(trade_log) as f:
+                    for line in f:
+                        if " | " not in line or "OPEN|" not in line:
+                            continue
+                        _, _, trade_part = line.partition(" | ")
+                        parts = trade_part.strip().split("|")
                         fields = {}
                         for p in parts[3:]:
                             if "=" in p:
                                 k, v = p.split("=", 1)
                                 fields[k] = v
+                        if "deal" in fields and "pattern" in fields:
+                            log_patterns[fields["deal"]] = fields["pattern"]
+                for deal_id, pos in positions.items():
+                    if deal_id in log_patterns:
+                        pos["pattern"] = log_patterns[deal_id]
+            except Exception:
+                pass
 
-                        ts_raw = line.split(" | ")[0].strip()
-                        opened_at = ts_raw[:16]
-                        instrument = pair_name.replace("/", "_")
-                        deal_id = fields.get("deal", instrument)
-
-                        positions[deal_id] = {
-                            "deal_id": deal_id,
-                            "instrument": instrument,
-                            "direction": direction,
-                            "entry": float(fields.get("entry", 0)),
-                            "sl": float(fields.get("sl", 0)),
-                            "tp": float(fields.get("tp", 0)),
-                            "size": float(fields.get("size", 0)),
-                            "pattern": fields.get("pattern", ""),
-                            "opened_at": opened_at,
-                        }
-
-                elif trade_part.startswith("CLOSE|"):
-                    parts = trade_part.split("|")
-                    fields = {}
-                    for p in parts[2:]:
-                        if "=" in p:
-                            k, v = p.split("=", 1)
-                            fields[k] = v
-                    deal_id = fields.get("deal")
-                    if deal_id:
-                        positions.pop(deal_id, None)
-                    elif len(parts) >= 2:
-                        # deal_idなしの旧ログ形式: instrumentで全件クローズ
-                        inst = parts[1].replace("/", "_")
-                        for did in [d for d, p in positions.items() if p["instrument"] == inst]:
-                            positions.pop(did, None)
-
-    except Exception as e:
-        logger.error(f"Error reading trade log: {e}")
-
-    # SQLiteの最新SL/TPで上書き（deal_idで正確に照合）
+    # 4. Overlay SL/TP from SQLite (deal_idで正確に照合)
     try:
         import sys
         sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -1235,21 +1253,59 @@ def _get_positions() -> list[dict]:
     except Exception as e:
         logger.warning(f"Could not overlay SL/TP from SQLite: {e}")
 
-    logger.info(f"Positions from log: {[p['deal_id'] for p in positions.values()]}")
     return list(positions.values())
 
 
 def main() -> None:
     """Run the dashboard server."""
     import argparse
+
+    def _can_bind(host: str, port: int) -> bool:
+        """Check whether host:port can be bound by this process."""
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                sock.bind((host, port))
+                return True
+            except OSError:
+                return False
+
+    def _select_port(host: str, preferred_port: int, max_offset: int = 20) -> int:
+        """Return the preferred port or the next available one."""
+        if _can_bind(host, preferred_port):
+            return preferred_port
+
+        for offset in range(1, max_offset + 1):
+            candidate = preferred_port + offset
+            if _can_bind(host, candidate):
+                logger.warning(
+                    "Port {} is already in use. Falling back to port {}.",
+                    preferred_port,
+                    candidate,
+                )
+                return candidate
+
+        raise RuntimeError(
+            f"No available port in range {preferred_port}-{preferred_port + max_offset}"
+        )
+
     parser = argparse.ArgumentParser(description="AI FX Bot Dashboard")
     parser.add_argument("--port", type=int, default=5000, help="Port (default: 5000)")
     parser.add_argument("--host", type=str, default="0.0.0.0", help="Host (default: 0.0.0.0)")
     args = parser.parse_args()
 
+    try:
+        selected_port = _select_port(args.host, args.port)
+    except RuntimeError as exc:
+        logger.error(
+            "Failed to start dashboard: {}. Use --port to specify an available port.",
+            exc,
+        )
+        raise SystemExit(1) from exc
+
     init_app()
-    print(f"\n  Dashboard: http://localhost:{args.port}\n")
-    app.run(host=args.host, port=args.port, debug=False)
+    print(f"\n  Dashboard: http://localhost:{selected_port}\n")
+    app.run(host=args.host, port=selected_port, debug=False)
 
 
 if __name__ == "__main__":

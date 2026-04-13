@@ -23,14 +23,7 @@ def main() -> None:
         line_config={
             "channel_access_token": os.getenv("LINE_CHANNEL_ACCESS_TOKEN", ""),
             "user_id": os.getenv("LINE_USER_ID", ""),
-        },
-        email_config={
-            "smtp_host": os.getenv("SMTP_HOST", ""),
-            "smtp_port": os.getenv("SMTP_PORT", "587"),
-            "smtp_user": os.getenv("SMTP_USER", ""),
-            "smtp_password": os.getenv("SMTP_PASSWORD", ""),
-            "from": os.getenv("EMAIL_FROM", ""),
-            "to": os.getenv("EMAIL_TO", ""),
+            "imgbb_api_key": os.getenv("IMGBB_API_KEY", ""),
         },
     )
 
