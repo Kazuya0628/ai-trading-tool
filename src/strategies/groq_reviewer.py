@@ -19,7 +19,24 @@ class GroqReviewer:
 
     MODEL = "llama-3.3-70b-versatile"
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        client: Any | None = None,
+        daily_limit: int | None = None,
+    ) -> None:
+        self._daily_count: int = 0
+        self._daily_count_utc_date: str = self._utc_today()
+        self._daily_limit: int = self._resolve_daily_limit(daily_limit)
+        # Daily quota circuit breaker (Groq free tier TPD limit).
+        # When 429 hits, suspend until next UTC day.
+        self._rate_limited_date: str = ""
+
+        if client is not None:
+            self._client = client
+            logger.info("[Groq] GroqReviewer initialized with injected client")
+            return
+
         api_key = os.getenv("GROQ_API_KEY", "")
         if not api_key:
             logger.warning("[Groq] GROQ_API_KEY が未設定です。週次レビューはスキップされます。")
@@ -33,28 +50,76 @@ class GroqReviewer:
             logger.warning("[Groq] groq パッケージがインストールされていません。pip install groq")
             self._client = None
 
-        # Daily quota circuit breaker (Groq free tier TPD limit).
-        # When 429 hits, suspend until next UTC day.
-        self._rate_limited_date: str = ""
+    @staticmethod
+    def _utc_today() -> str:
+        from datetime import datetime as _dt
+
+        return _dt.utcnow().strftime("%Y-%m-%d")
+
+    @staticmethod
+    def _resolve_daily_limit(configured_limit: int | None) -> int:
+        if configured_limit is not None:
+            try:
+                return max(1, int(configured_limit))
+            except (TypeError, ValueError):
+                pass
+
+        env_limit = os.getenv("GROQ_DAILY_HARD_LIMIT", "")
+        try:
+            return max(1, int(env_limit)) if env_limit else 9999
+        except ValueError:
+            return 9999
+
+    def _refresh_daily_counter(self) -> None:
+        today = self._utc_today()
+        if self._daily_count_utc_date != today:
+            self._daily_count = 0
+            self._daily_count_utc_date = today
+
+    def _consume_daily_call(self) -> None:
+        self._refresh_daily_counter()
+        self._daily_count += 1
+
+    @property
+    def daily_count(self) -> int:
+        self._refresh_daily_counter()
+        return self._daily_count
+
+    @property
+    def daily_limit(self) -> int:
+        return self._daily_limit
+
+    @property
+    def daily_remaining(self) -> int:
+        return max(0, self.daily_limit - self.daily_count)
 
     @property
     def available(self) -> bool:
         if self._client is None:
             return False
+        self._refresh_daily_counter()
         # Auto-reset on new day
-        from datetime import datetime as _dt
-        today = _dt.utcnow().strftime("%Y-%m-%d")
+        today = self._utc_today()
         if self._rate_limited_date and self._rate_limited_date != today:
             self._rate_limited_date = ""
             logger.info("[Groq] Daily quota reset — resuming Groq calls")
-        return not self._rate_limited_date
+        if self._rate_limited_date:
+            return False
+        return self._daily_count < self._daily_limit
+
+    def get_status(self) -> dict[str, Any]:
+        return {
+            "available": self.available,
+            "daily_used": self.daily_count,
+            "daily_hard_limit": self.daily_limit,
+            "daily_remaining": self.daily_remaining,
+        }
 
     def _handle_rate_limit(self, err: Exception) -> bool:
         """Return True if the error is a 429 rate limit and breaker was tripped."""
         msg = str(err)
         if "429" in msg or "rate_limit" in msg.lower():
-            from datetime import datetime as _dt
-            self._rate_limited_date = _dt.utcnow().strftime("%Y-%m-%d")
+            self._rate_limited_date = self._utc_today()
             logger.warning(
                 "[Groq] Daily token quota exhausted — suspending Groq until tomorrow (UTC)"
             )
@@ -114,6 +179,7 @@ class GroqReviewer:
                 max_tokens=512,
                 temperature=0.2,
             )
+            self._consume_daily_call()
             raw = response.choices[0].message.content.strip()
             return self._parse_response(raw, proposed_threshold)
 
@@ -294,6 +360,7 @@ class GroqReviewer:
                 max_tokens=400,
                 temperature=0.1,
             )
+            self._consume_daily_call()
             raw = response.choices[0].message.content.strip()
             result = self._parse_regime_response(raw)
             logger.info(
@@ -475,6 +542,7 @@ class GroqReviewer:
                 max_tokens=256,
                 temperature=0.1,
             )
+            self._consume_daily_call()
             raw = response.choices[0].message.content.strip()
             result = self._parse_direction_response(raw)
             logger.info(

@@ -10,10 +10,7 @@ Lightweight Flask app displaying:
 from __future__ import annotations
 
 import json
-import os
-import shlex
 import socket
-import subprocess
 import sys
 import threading
 import time
@@ -44,237 +41,6 @@ _stream_stop = threading.Event()
 _cache: dict[str, Any] = {}
 _cache_time: float = 0
 _CACHE_TTL = 30  # seconds
-_PROJECT_ROOT = Path(__file__).parent.parent.resolve()
-_MAIN_SCRIPT_PATH = (_PROJECT_ROOT / "main.py").resolve()
-
-
-def _safe_int(value: Any) -> int | None:
-    """Best-effort conversion to int."""
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return None
-
-
-def _derive_budget_snapshot(payload: dict[str, Any]) -> dict[str, Any]:
-    """Build dashboard-friendly Gemini/Groq budget snapshot from ai_log payload."""
-    gemini_used: int | None = None
-    gemini_limit: int | None = None
-    groq_available: bool | None = None
-    groq_used: int | None = None
-    groq_limit: int | None = None
-
-    raw_budget = payload.get("budget")
-    if isinstance(raw_budget, dict):
-        raw_gemini = raw_budget.get("gemini")
-        if isinstance(raw_gemini, dict):
-            gemini_used = _safe_int(raw_gemini.get("daily_used", raw_gemini.get("used")))
-            gemini_limit = _safe_int(raw_gemini.get("daily_hard_limit", raw_gemini.get("limit")))
-
-        raw_groq = raw_budget.get("groq")
-        if isinstance(raw_groq, dict):
-            if isinstance(raw_groq.get("available"), bool):
-                groq_available = raw_groq.get("available")
-            groq_used = _safe_int(raw_groq.get("daily_used", raw_groq.get("used")))
-            groq_limit = _safe_int(raw_groq.get("daily_hard_limit", raw_groq.get("limit")))
-
-    pairs = payload.get("pairs")
-    if isinstance(pairs, dict) and pairs:
-        # Legacy fallback: derive Gemini budget from per-pair gemini_status.
-        if gemini_used is None or gemini_limit is None:
-            for pair_data in pairs.values():
-                if not isinstance(pair_data, dict):
-                    continue
-                g = pair_data.get("gemini_status")
-                if not isinstance(g, dict):
-                    continue
-                used_candidate = _safe_int(g.get("budget_used"))
-                limit_candidate = _safe_int(g.get("budget_limit"))
-                if used_candidate is not None:
-                    gemini_used = used_candidate
-                if limit_candidate is not None:
-                    gemini_limit = limit_candidate
-                if gemini_used is not None and gemini_limit is not None:
-                    break
-
-        # Legacy fallback: infer Groq availability from vote reasoning.
-        if groq_available is None:
-            groq_reasonings: list[str] = []
-            for pair_data in pairs.values():
-                if not isinstance(pair_data, dict):
-                    continue
-                gv = pair_data.get("groq_vote")
-                if not isinstance(gv, dict):
-                    continue
-                reasoning = str(gv.get("reasoning", "")).strip()
-                if reasoning:
-                    groq_reasonings.append(reasoning)
-            if groq_reasonings:
-                groq_available = any("Groq未使用" not in r for r in groq_reasonings)
-
-    gemini_remaining: int | None = None
-    if gemini_used is not None and gemini_limit is not None:
-        gemini_remaining = max(0, gemini_limit - gemini_used)
-
-    groq_remaining: int | None = None
-    if groq_used is not None and groq_limit is not None:
-        groq_remaining = max(0, groq_limit - groq_used)
-        if groq_available is None:
-            groq_available = groq_remaining > 0
-
-    # If Groq is explicitly unavailable, always prefer stopped label.
-    if groq_available is False:
-        groq_remaining = None
-
-    if groq_remaining is not None and groq_limit is not None:
-        groq_remaining_label = f"{groq_remaining}/{groq_limit}"
-    elif groq_available is True:
-        groq_remaining_label = "利用可"
-    elif groq_available is False:
-        groq_remaining_label = "停止中"
-    else:
-        groq_remaining_label = "不明"
-
-    return {
-        "gemini": {
-            "daily_used": gemini_used,
-            "daily_hard_limit": gemini_limit,
-            "daily_remaining": gemini_remaining,
-        },
-        "groq": {
-            "available": groq_available,
-            "daily_used": groq_used,
-            "daily_hard_limit": groq_limit,
-            "daily_remaining": groq_remaining,
-            "daily_remaining_label": groq_remaining_label,
-        },
-    }
-
-
-def _is_main_bot_command(command: str) -> bool:
-    """Return True when command line runs this repository's standalone main.py bot."""
-    normalized = command.strip()
-    if not normalized:
-        return False
-    if "dashboard.py" in normalized or "grep " in normalized:
-        return False
-
-    try:
-        tokens = shlex.split(normalized)
-    except ValueError:
-        tokens = normalized.split()
-
-    if len(tokens) < 2:
-        return False
-
-    script_arg = ""
-    for token in tokens[1:]:
-        if token.startswith("-"):
-            continue
-        script_arg = token
-        break
-
-    if not script_arg:
-        return False
-
-    script_path = Path(script_arg)
-    if not script_path.is_absolute():
-        script_path = (_PROJECT_ROOT / script_path).resolve()
-    else:
-        script_path = script_path.resolve()
-
-    if script_path != _MAIN_SCRIPT_PATH:
-        return False
-
-    # Exclude one-shot utility commands that should not count as live bot runtime.
-    one_shot_flags = {"--backtest", "--status", "--analyze", "--download", "--trade-once"}
-    if any(flag in tokens for flag in one_shot_flags):
-        return False
-
-    return True
-
-
-def _detect_main_bot_process() -> dict[str, Any]:
-    """Scan process table and find currently running main.py bot."""
-    try:
-        result = subprocess.run(
-            ["ps", "-axo", "pid=,command="],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        if result.returncode != 0:
-            return {"alive": False, "pid": None}
-
-        self_pid = os.getpid()
-        for raw_line in result.stdout.splitlines():
-            line = raw_line.strip()
-            if not line:
-                continue
-            parts = line.split(maxsplit=1)
-            if len(parts) != 2:
-                continue
-
-            pid_str, command = parts
-            if not pid_str.isdigit():
-                continue
-
-            pid = int(pid_str)
-            if pid == self_pid:
-                continue
-            if _is_main_bot_command(command):
-                return {"alive": True, "pid": pid}
-    except Exception as e:
-        logger.debug(f"_detect_main_bot_process failed: {e}")
-
-    return {"alive": False, "pid": None}
-
-
-def _is_pid_main_bot(pid: int) -> bool:
-    """Check whether given PID is a live process running main.py bot."""
-    if pid <= 0:
-        return False
-    try:
-        result = subprocess.run(
-            ["ps", "-p", str(pid), "-o", "command="],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        if result.returncode != 0:
-            return False
-        return _is_main_bot_command(result.stdout.strip())
-    except Exception as e:
-        logger.debug(f"_is_pid_main_bot failed: {e}")
-        return False
-
-
-def _resolve_bot_process_status(log_pid: Any) -> dict[str, Any]:
-    """Resolve bot status based on real process survival, with log-pid fallback."""
-    parsed_pid = 0
-    try:
-        if log_pid is not None:
-            parsed_pid = int(log_pid)
-    except (TypeError, ValueError):
-        parsed_pid = 0
-
-    if parsed_pid > 0 and _is_pid_main_bot(parsed_pid):
-        return {
-            "process_alive": True,
-            "process_pid": parsed_pid,
-        }
-
-    detected = _detect_main_bot_process()
-    if detected.get("alive"):
-        return {
-            "process_alive": True,
-            "process_pid": detected.get("pid"),
-        }
-
-    return {
-        "process_alive": False,
-        "process_pid": None,
-    }
 
 DASHBOARD_HTML = """
 <!DOCTYPE html>
@@ -600,14 +366,6 @@ DASHBOARD_HTML = """
         <div class="info-card">
             <h3>Win Rate</h3>
             <div class="value" id="win-rate">--</div>
-        </div>
-        <div class="info-card">
-            <h3>Gemini 残量</h3>
-            <div class="value" id="gemini-budget">--</div>
-        </div>
-        <div class="info-card">
-            <h3>Groq 残量</h3>
-            <div class="value" id="groq-budget">--</div>
         </div>
     </div>
 
@@ -1036,89 +794,21 @@ DASHBOARD_HTML = """
 
         function updateBotStatus(data) {
             const badge = document.getElementById('bot-status-badge');
-            if (!data) {
+            if (!data || !data.updated_at) {
                 badge.className = 'bot-status unknown';
                 badge.innerHTML = '<span class="bot-dot"></span> Bot: データなし';
                 return;
             }
-
-            if (typeof data.process_alive === 'boolean') {
-                if (data.process_alive) {
-                    badge.className = 'bot-status running';
-                    const updatedLabel = data.updated_at
-                        ? `${data.updated_at.slice(11, 16)} 更新`
-                        : '更新待機';
-                    const pidLabel = data.process_pid
-                        ? `PID ${data.process_pid} / `
-                        : '';
-                    badge.innerHTML = `<span class="bot-dot"></span> Bot: 稼働中 (${pidLabel}${updatedLabel})`;
-                } else {
-                    badge.className = 'bot-status stopped';
-                    if (data.updated_at) {
-                        const updated = new Date(data.updated_at.replace(' ', 'T'));
-                        if (!Number.isNaN(updated.getTime())) {
-                            const ago = Math.max(
-                                0,
-                                Math.floor((Date.now() - updated.getTime()) / 60000)
-                            );
-                            badge.innerHTML = `<span class="bot-dot"></span> Bot: 停止中 (${ago}分前が最終更新)`;
-                        } else {
-                            badge.innerHTML = '<span class="bot-dot"></span> Bot: 停止中 (最終更新時刻を解析不可)';
-                        }
-                    } else {
-                        badge.innerHTML = '<span class="bot-dot"></span> Bot: 停止中 (プロセス未検出)';
-                    }
-                }
-                return;
-            }
-
-            // Backward compatibility for older /api/ai_log payloads.
-            if (!data.updated_at) {
-                badge.className = 'bot-status unknown';
-                badge.innerHTML = '<span class="bot-dot"></span> Bot: データなし';
-                return;
-            }
-
             const updated = new Date(data.updated_at.replace(' ', 'T'));
             const diffMin = (Date.now() - updated.getTime()) / 60000;
+            // 最終更新から12分以内なら稼働中（5分サイクル + 余裕7分）
             if (diffMin <= 12) {
                 badge.className = 'bot-status running';
                 badge.innerHTML = `<span class="bot-dot"></span> Bot: 稼働中 (${data.updated_at.slice(11, 16)} 更新)`;
             } else {
                 badge.className = 'bot-status stopped';
-                badge.innerHTML = `<span class="bot-dot"></span> Bot: 停止中 (${Math.floor(diffMin)}分前が最終更新)`;
-            }
-        }
-
-        function updateAiBudget(data) {
-            const geminiEl = document.getElementById('gemini-budget');
-            const groqEl = document.getElementById('groq-budget');
-
-            const budget = data && data.budget ? data.budget : {};
-            const gemini = budget.gemini || {};
-            const groq = budget.groq || {};
-
-            if (gemini.daily_remaining != null && gemini.daily_hard_limit != null) {
-                geminiEl.textContent = `${gemini.daily_remaining}/${gemini.daily_hard_limit}`;
-                geminiEl.style.color = gemini.daily_remaining > 0 ? '#22c55e' : '#ef4444';
-            } else {
-                geminiEl.textContent = '--';
-                geminiEl.style.color = '#888';
-            }
-
-            if (
-                groq.available !== false &&
-                groq.daily_remaining != null &&
-                groq.daily_hard_limit != null
-            ) {
-                groqEl.textContent = `${groq.daily_remaining}/${groq.daily_hard_limit}`;
-                groqEl.style.color = groq.daily_remaining > 0 ? '#22c55e' : '#ef4444';
-            } else {
-                const groqLabel = groq.daily_remaining_label || '不明';
-                groqEl.textContent = groqLabel;
-                groqEl.style.color =
-                    groqLabel === '利用可' ? '#22c55e' :
-                    groqLabel === '停止中' ? '#ef4444' : '#888';
+                const ago = Math.floor(diffMin);
+                badge.innerHTML = `<span class="bot-dot"></span> Bot: 停止中 (${ago}分前が最終更新)`;
             }
         }
 
@@ -1127,10 +817,8 @@ DASHBOARD_HTML = """
                 const resp = await fetch('/api/ai_log');
                 const data = await resp.json();
                 updateBotStatus(data);
-                updateAiBudget(data);
                 document.getElementById('ai-log-container').innerHTML = buildAiLogHTML(data);
             } catch (e) {
-                updateAiBudget(null);
                 document.getElementById('ai-log-container').innerHTML =
                     '<div class="no-data-msg">AI分析ログの取得に失敗しました</div>';
             }
@@ -1415,27 +1103,11 @@ def api_ai_log() -> Any:
     """Return AI analysis log written by TradingBot each cycle."""
     log_path = Path(__file__).parent.parent / "data" / "ai_analysis_log.json"
     if not log_path.exists():
-        payload = {"pairs": {}, "regime": {}, "updated_at": None}
-        process_status = _resolve_bot_process_status(None)
-        payload = {
-            **payload,
-            **process_status,
-            "budget": _derive_budget_snapshot(payload),
-        }
-        return jsonify(payload)
+        return jsonify({"pairs": {}, "regime": {}, "updated_at": None})
     try:
         with open(log_path, encoding="utf-8") as f:
             data = json.load(f)
-        if not isinstance(data, dict):
-            data = {"pairs": {}, "regime": {}, "updated_at": None}
-
-        process_status = _resolve_bot_process_status(data.get("pid"))
-        payload = {
-            **data,
-            **process_status,
-            "budget": _derive_budget_snapshot(data),
-        }
-        return jsonify(payload)
+        return jsonify(data)
     except Exception as e:
         logger.error(f"ai_log read error: {e}")
         return jsonify({"error": str(e)}), 500

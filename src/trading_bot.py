@@ -110,7 +110,9 @@ class TradingBot:
         # --- Services (design doc: separated from orchestrator) ---
         from src.strategies.groq_reviewer import GroqReviewer
         from src.data.sentiment_fetcher import SentimentFetcher
-        self.groq_reviewer = GroqReviewer()
+        self.groq_reviewer = GroqReviewer(
+            daily_limit=self.config.groq_config.get("daily_hard_limit")
+        )
         self.sentiment_fetcher = SentimentFetcher()
         self._last_sentiment: dict = {}
         self._last_sentiment_ts: float = 0.0
@@ -845,11 +847,43 @@ class TradingBot:
                 }
 
             import os as _os
+
+            gemini_used = int(self._gemini_daily_count)
+            gemini_limit = int(self._gemini_daily_limit)
+            gemini_remaining = max(0, gemini_limit - gemini_used)
+
+            def _safe_int(value: Any) -> int | None:
+                try:
+                    return int(value)
+                except (TypeError, ValueError):
+                    return None
+
+            groq_used = _safe_int(getattr(self.groq_reviewer, "daily_count", None))
+            groq_limit = _safe_int(getattr(self.groq_reviewer, "daily_limit", None))
+            groq_remaining = (
+                max(0, groq_limit - groq_used)
+                if groq_used is not None and groq_limit is not None
+                else None
+            )
+
             payload = {
                 "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 "pid": _os.getpid(),
                 "regime": regime_data,
                 "pairs": self._cycle_log,
+                "budget": {
+                    "gemini": {
+                        "daily_used": gemini_used,
+                        "daily_hard_limit": gemini_limit,
+                        "daily_remaining": gemini_remaining,
+                    },
+                    "groq": {
+                        "available": bool(getattr(self.groq_reviewer, "available", False)),
+                        "daily_used": groq_used,
+                        "daily_hard_limit": groq_limit,
+                        "daily_remaining": groq_remaining,
+                    },
+                },
             }
             log_path = Path("data/ai_analysis_log.json")
             log_path.parent.mkdir(parents=True, exist_ok=True)
